@@ -1,0 +1,20 @@
+{
+  "rewrites": [
+    {
+      "source": "/api/search",
+      "destination": "/api/search.js"
+    },
+    {
+      "source": "/api/trending",
+      "destination": "/api/trending.js"
+    },
+    {
+      "source": "/api/spotify/playlist",
+      "destination": "/api/spotify.js"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ]
+}
