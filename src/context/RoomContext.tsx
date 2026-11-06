@@ -1,6 +1,15 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
-import { RoomState, RoomPeer, RoomMessage, FloatingReaction, Track } from '../types';
+import {
+  RoomState,
+  RoomPeer,
+  RoomMessage,
+  FloatingReaction,
+  Track,
+  AuxMode,
+  SoundEffectType,
+} from '../types';
 import { roomSync, RoomSyncService, SyncPayload } from '../services/roomSync';
+import { playPartySound } from '../services/soundEffects';
 import { usePlayer } from './PlayerContext';
 
 interface RoomContextType {
@@ -14,8 +23,13 @@ interface RoomContextType {
   leaveRoom: () => void;
   sendMessage: (text: string) => void;
   sendReaction: (emoji: string) => void;
+  triggerSound: (sound: SoundEffectType) => void;
+  voteSkip: () => void;
+  setAuxMode: (mode: AuxMode) => void;
+  transferAux: (targetPeerName: string) => void;
   addToRoomQueue: (track: Track) => void;
   addManyToRoomQueue: (tracks: Track[]) => void;
+  upvoteTrack: (trackId: string) => void;
   clearError: () => void;
 }
 
@@ -23,10 +37,14 @@ const initialRoomState: RoomState = {
   roomId: '',
   roomCode: '',
   isHost: false,
+  isDJ: false,
   hostName: '',
+  activeDjName: '',
   userName: '',
   connected: false,
   peers: [],
+  auxMode: 'host-only',
+  skipVotes: [],
 };
 
 const RoomContext = createContext<RoomContextType | null>(null);
@@ -39,14 +57,22 @@ export const RoomProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [error, setError] = useState<string | null>(null);
   const [isConnecting, setIsConnecting] = useState<boolean>(false);
 
-  // Hook player state changes to broadcast when Host
+  // Inform peers whenever playback state changes (if Host or Open Aux)
   useEffect(() => {
     player.setOnStateChangeNotify((track, isPlaying, position, queue) => {
-      if (roomSync.isHost && roomState.connected) {
+      if (roomState.connected && (roomState.isHost || roomState.auxMode === 'open-aux' || roomState.isDJ)) {
         roomSync.broadcastPlayback(track, isPlaying, position, queue);
       }
     });
-  }, [roomState.connected, player]);
+  }, [roomState.connected, roomState.isHost, roomState.auxMode, roomState.isDJ, player]);
+
+  // Reset skip votes when currentTrack changes
+  useEffect(() => {
+    if (roomState.isHost && roomState.connected) {
+      roomSync.resetSkipVotes();
+      setRoomState((prev) => ({ ...prev, skipVotes: [] }));
+    }
+  }, [player.currentTrack?.id]);
 
   // Setup callbacks for roomSync
   useEffect(() => {
@@ -59,13 +85,20 @@ export const RoomProvider: React.FC<{ children: React.ReactNode }> = ({ children
           payload.timestamp || Date.now(),
           payload.queue
         );
+        if (payload.skipVotes) {
+          setRoomState((prev) => ({ ...prev, skipVotes: payload.skipVotes || [] }));
+        }
       } else if (payload.type === 'QUEUE_UPDATE' && payload.queue) {
         player.syncFromHost(player.currentTrack, player.isPlaying, player.currentTime, Date.now(), payload.queue);
       }
     };
 
     roomSync.onPeersUpdated = (peers: RoomPeer[]) => {
-      setRoomState((prev) => ({ ...prev, peers }));
+      setRoomState((prev) => ({
+        ...prev,
+        peers,
+        isDJ: prev.auxMode === 'open-aux' || prev.activeDjName === prev.userName,
+      }));
     };
 
     roomSync.onChatReceived = (msg: RoomMessage) => {
@@ -80,19 +113,85 @@ export const RoomProvider: React.FC<{ children: React.ReactNode }> = ({ children
         x: Math.random() * 80 + 10,
       };
       setReactions((prev) => [...prev, newReaction]);
-
       setTimeout(() => {
         setReactions((prev) => prev.filter((r) => r.id !== newReaction.id));
       }, 2800);
     };
 
+    // Sound effect triggered by peer
+    roomSync.onSoundTriggered = (sound: SoundEffectType, sender: string) => {
+      playPartySound(sound);
+      const icon = sound === 'airhorn' ? '📢' : sound === 'scratch' ? '💽' : sound === 'bassdrop' ? '💣' : '👏';
+      const soundMsg: RoomMessage = {
+        id: `snd-${Date.now()}`,
+        sender: 'AuxParty',
+        text: `${sender} dropped ${icon} ${sound.toUpperCase()}!`,
+        timestamp: Date.now(),
+        isSystem: true,
+      };
+      setMessages((prev) => [...prev, soundMsg]);
+    };
+
+    // Vote to skip received
+    roomSync.onVoteSkipReceived = (skipVotes: string[]) => {
+      setRoomState((prev) => {
+        const totalPeers = Math.max(1, prev.peers.length);
+        const threshold = Math.ceil(totalPeers / 2);
+
+        // If threshold reached and I am host, skip!
+        if (prev.isHost && skipVotes.length >= threshold && totalPeers > 1) {
+          player.nextTrack();
+          roomSync.resetSkipVotes();
+          const skipMsg: RoomMessage = {
+            id: `skip-${Date.now()}`,
+            sender: 'AuxParty',
+            text: `Majority vote reached (${skipVotes.length}/${totalPeers})! Skipping song ⏭️`,
+            timestamp: Date.now(),
+            isSystem: true,
+          };
+          roomSync.broadcast({ type: 'CHAT', message: skipMsg });
+          setMessages((m) => [...m, skipMsg]);
+          return { ...prev, skipVotes: [] };
+        }
+
+        return { ...prev, skipVotes };
+      });
+    };
+
+    // Aux Mode changed
+    roomSync.onAuxModeChanged = (mode: AuxMode) => {
+      setRoomState((prev) => ({
+        ...prev,
+        auxMode: mode,
+        isDJ: mode === 'open-aux' || prev.activeDjName === prev.userName,
+      }));
+    };
+
+    // DJ Changed
+    roomSync.onDjChanged = (djName: string, isMe: boolean) => {
+      setRoomState((prev) => ({
+        ...prev,
+        activeDjName: djName,
+        isDJ: isMe || prev.auxMode === 'open-aux',
+      }));
+      const djMsg: RoomMessage = {
+        id: `dj-${Date.now()}`,
+        sender: 'AuxParty',
+        text: `The Aux Cord was passed to 👑 ${djName}!`,
+        timestamp: Date.now(),
+        isSystem: true,
+      };
+      setMessages((prev) => [...prev, djMsg]);
+    };
+
     // When a friend asks to add a song to the shared queue
     roomSync.onQueueAddRequested = (track: Track, sender: string) => {
-      player.addToQueue(track);
+      const enriched = { ...track, addedBy: sender, votes: 0 };
+      player.addToQueue(enriched);
       const queueMsg: RoomMessage = {
         id: `msg-${Date.now()}-${Math.random()}`,
         sender: 'AuxParty',
-        text: `${sender} added "${track.title}" to the queue 🎵`,
+        text: `${sender} queued "${track.title}" 🎵`,
         timestamp: Date.now(),
         isSystem: true,
       };
@@ -100,9 +199,10 @@ export const RoomProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setMessages((prev) => [...prev, queueMsg]);
     };
 
-    // When a friend asks to add multiple songs (e.g. from Spotify import)
+    // When a friend asks to add multiple songs
     roomSync.onQueueAddManyRequested = (tracks: Track[], sender: string) => {
-      tracks.forEach((t) => player.addToQueue(t));
+      const enriched = tracks.map((t) => ({ ...t, addedBy: sender, votes: 0 }));
+      enriched.forEach((t) => player.addToQueue(t));
       const queueMsg: RoomMessage = {
         id: `msg-${Date.now()}-${Math.random()}`,
         sender: 'AuxParty',
@@ -124,6 +224,10 @@ export const RoomProvider: React.FC<{ children: React.ReactNode }> = ({ children
       roomSync.onPeersUpdated = undefined;
       roomSync.onChatReceived = undefined;
       roomSync.onReactionReceived = undefined;
+      roomSync.onSoundTriggered = undefined;
+      roomSync.onVoteSkipReceived = undefined;
+      roomSync.onAuxModeChanged = undefined;
+      roomSync.onDjChanged = undefined;
       roomSync.onQueueAddRequested = undefined;
       roomSync.onQueueAddManyRequested = undefined;
       roomSync.onError = undefined;
@@ -147,10 +251,14 @@ export const RoomProvider: React.FC<{ children: React.ReactNode }> = ({ children
         roomId: `auxparty-${code.toLowerCase()}`,
         roomCode: code,
         isHost: true,
+        isDJ: true,
         hostName: hostName || 'DJ (Host)',
+        activeDjName: hostName || 'DJ (Host)',
         userName: hostName || 'DJ (Host)',
         connected: true,
-        peers: [{ id: 'host', name: hostName || 'DJ (Host)', isHost: true }],
+        peers: [{ id: 'host', name: hostName || 'DJ (Host)', isHost: true, isDJ: true, color: '#8b5cf6' }],
+        auxMode: 'host-only',
+        skipVotes: [],
       });
       setMessages([
         {
@@ -178,10 +286,14 @@ export const RoomProvider: React.FC<{ children: React.ReactNode }> = ({ children
         roomId: `auxparty-${cleanCode.toLowerCase()}`,
         roomCode: cleanCode,
         isHost: false,
+        isDJ: false,
         hostName: 'Host',
+        activeDjName: 'DJ',
         userName: guestName || 'Friend',
         connected: true,
         peers: [],
+        auxMode: 'host-only',
+        skipVotes: [],
       });
       return true;
     }
@@ -205,19 +317,69 @@ export const RoomProvider: React.FC<{ children: React.ReactNode }> = ({ children
     roomSync.sendReaction(emoji);
   };
 
+  const triggerSound = (sound: SoundEffectType) => {
+    if (!roomState.connected) return;
+    playPartySound(sound);
+    roomSync.triggerSound(sound);
+  };
+
+  const voteSkip = () => {
+    if (!roomState.connected) return;
+    roomSync.voteSkip();
+  };
+
+  const setAuxMode = (mode: AuxMode) => {
+    roomSync.setAuxMode(mode);
+    setRoomState((prev) => ({
+      ...prev,
+      auxMode: mode,
+      isDJ: mode === 'open-aux' || prev.activeDjName === prev.userName,
+    }));
+  };
+
+  const transferAux = (targetPeerName: string) => {
+    roomSync.transferAux(targetPeerName);
+    setRoomState((prev) => ({
+      ...prev,
+      activeDjName: targetPeerName,
+      isDJ: targetPeerName === prev.userName,
+    }));
+  };
+
   const addToRoomQueue = (track: Track) => {
+    const enriched = { ...track, addedBy: roomState.userName, votes: 0 };
     if (roomState.isHost) {
-      player.addToQueue(track);
+      player.addToQueue(enriched);
     } else {
-      roomSync.requestAddToQueue(track);
+      roomSync.requestAddToQueue(enriched);
     }
   };
 
   const addManyToRoomQueue = (tracks: Track[]) => {
+    const enriched = tracks.map((t) => ({ ...t, addedBy: roomState.userName, votes: 0 }));
     if (roomState.isHost) {
-      tracks.forEach((t) => player.addToQueue(t));
+      enriched.forEach((t) => player.addToQueue(t));
     } else {
-      roomSync.requestAddManyToQueue(tracks);
+      roomSync.requestAddManyToQueue(enriched);
+    }
+  };
+
+  const upvoteTrack = (trackId: string) => {
+    // Increment vote count and sort queue
+    if (roomState.isHost) {
+      const updatedQueue = player.queue.map((t) => {
+        if (t.id === trackId) {
+          const currentVotes = (t.votes || 0) + 1;
+          return { ...t, votes: currentVotes };
+        }
+        return t;
+      });
+      // Sort by votes descending
+      updatedQueue.sort((a, b) => (b.votes || 0) - (a.votes || 0));
+      player.syncFromHost(player.currentTrack, player.isPlaying, player.currentTime, Date.now(), updatedQueue);
+      roomSync.broadcast({ type: 'QUEUE_UPDATE', queue: updatedQueue });
+    } else {
+      roomSync.broadcast({ type: 'VOTE_TRACK', trackId, sender: roomState.userName });
     }
   };
 
@@ -236,8 +398,13 @@ export const RoomProvider: React.FC<{ children: React.ReactNode }> = ({ children
         leaveRoom,
         sendMessage,
         sendReaction,
+        triggerSound,
+        voteSkip,
+        setAuxMode,
+        transferAux,
         addToRoomQueue,
         addManyToRoomQueue,
+        upvoteTrack,
         clearError,
       }}
     >

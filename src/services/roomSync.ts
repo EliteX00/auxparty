@@ -1,5 +1,5 @@
 import { Peer, DataConnection } from 'peerjs';
-import { Track, RoomPeer, RoomMessage } from '../types';
+import { Track, RoomPeer, RoomMessage, AuxMode, SoundEffectType } from '../types';
 
 export type SyncEventType =
   | 'INIT_SYNC'
@@ -15,6 +15,10 @@ export type SyncEventType =
   | 'CHAT'
   | 'REACTION'
   | 'PEER_LIST'
+  | 'TRIGGER_SOUND'
+  | 'VOTE_SKIP'
+  | 'VOTE_TRACK'
+  | 'SET_AUX_MODE'
   | 'TRANSFER_AUX';
 
 export interface SyncPayload {
@@ -26,11 +30,16 @@ export interface SyncPayload {
   timestamp?: number;
   queue?: Track[];
   hostName?: string;
+  activeDjName?: string;
   sender?: string;
   peers?: RoomPeer[];
   message?: RoomMessage;
   emoji?: string;
+  sound?: SoundEffectType;
+  auxMode?: AuxMode;
   targetPeerId?: string;
+  skipVotes?: string[];
+  trackId?: string;
 }
 
 export class RoomSyncService {
@@ -38,20 +47,28 @@ export class RoomSyncService {
   private connections: Map<string, DataConnection> = new Map();
   private hostConnection: DataConnection | null = null;
   public isHost: boolean = false;
+  public isDJ: boolean = false;
   public roomCode: string = '';
   public userName: string = '';
+  public auxMode: AuxMode = 'host-only';
+  public activeDjName: string = '';
 
   public onSyncReceived?: (payload: SyncPayload) => void;
   public onPeersUpdated?: (peers: RoomPeer[]) => void;
   public onChatReceived?: (msg: RoomMessage) => void;
   public onReactionReceived?: (emoji: string, sender: string) => void;
+  public onSoundTriggered?: (sound: SoundEffectType, sender: string) => void;
   public onQueueAddRequested?: (track: Track, sender: string) => void;
   public onQueueAddManyRequested?: (tracks: Track[], sender: string) => void;
+  public onVoteSkipReceived?: (skipVotes: string[]) => void;
+  public onVoteTrackReceived?: (trackId: string, sender: string) => void;
+  public onAuxModeChanged?: (mode: AuxMode) => void;
+  public onDjChanged?: (djName: string, isMe: boolean) => void;
   public onError?: (err: string) => void;
 
   private activePeers: RoomPeer[] = [];
+  public currentSkipVotes: Set<string> = new Set();
 
-  // Generate 4-6 char room code (e.g. FG2F or AUX982)
   public static generateRoomCode(len: number = 4): string {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
     let code = '';
@@ -70,7 +87,21 @@ export class RoomSyncService {
     this.roomCode = roomCode.toUpperCase();
     this.userName = hostName || 'DJ (Host)';
     this.isHost = true;
-    this.activePeers = [{ id: 'host', name: this.userName, isHost: true }];
+    this.isDJ = true;
+    this.activeDjName = this.userName;
+    this.auxMode = 'host-only';
+    this.currentSkipVotes.clear();
+
+    const colors = ['#8b5cf6', '#ec4899', '#3b82f6', '#10b981', '#f59e0b', '#06b6d4'];
+    this.activePeers = [
+      {
+        id: 'host',
+        name: this.userName,
+        isHost: true,
+        isDJ: true,
+        color: colors[0],
+      },
+    ];
 
     const peerId = `auxparty-${this.roomCode.toLowerCase()}`;
 
@@ -115,17 +146,24 @@ export class RoomSyncService {
         const data = raw as SyncPayload;
         if (data.type === 'JOIN') {
           const peerName = data.sender || 'Friend';
-          const newPeer: RoomPeer = { id: conn.peer, name: peerName, isHost: false };
+          const colors = ['#8b5cf6', '#ec4899', '#3b82f6', '#10b981', '#f59e0b', '#06b6d4'];
+          const newPeer: RoomPeer = {
+            id: conn.peer,
+            name: peerName,
+            isHost: false,
+            isDJ: this.auxMode === 'open-aux',
+            color: colors[this.activePeers.length % colors.length],
+          };
           this.activePeers = [...this.activePeers.filter((p) => p.id !== conn.peer), newPeer];
 
-          // Broadcast peer list
           this.broadcast({
             type: 'PEER_LIST',
             peers: this.activePeers,
+            activeDjName: this.activeDjName,
+            auxMode: this.auxMode,
           });
           this.onPeersUpdated?.(this.activePeers);
 
-          // Send current state to newly joined guest
           conn.send({
             type: 'INIT_SYNC',
             track: getCurrentState.track,
@@ -134,10 +172,12 @@ export class RoomSyncService {
             timestamp: Date.now(),
             queue: getCurrentState.queue,
             hostName: this.userName,
+            activeDjName: this.activeDjName,
             peers: this.activePeers,
+            auxMode: this.auxMode,
+            skipVotes: Array.from(this.currentSkipVotes),
           } as SyncPayload);
 
-          // Broadcast join message
           const joinMsg: RoomMessage = {
             id: `msg-${Date.now()}-${Math.random()}`,
             sender: 'AuxParty',
@@ -153,10 +193,26 @@ export class RoomSyncService {
         } else if (data.type === 'REACTION' && data.emoji) {
           this.broadcast(data);
           this.onReactionReceived?.(data.emoji, data.sender || 'Friend');
+        } else if (data.type === 'TRIGGER_SOUND' && data.sound) {
+          this.broadcast(data);
+          this.onSoundTriggered?.(data.sound, data.sender || 'Friend');
         } else if (data.type === 'REQUEST_ADD_TO_QUEUE' && data.track) {
           this.onQueueAddRequested?.(data.track, data.sender || 'Friend');
         } else if (data.type === 'REQUEST_ADD_MANY_TO_QUEUE' && data.tracks) {
           this.onQueueAddManyRequested?.(data.tracks, data.sender || 'Friend');
+        } else if (data.type === 'VOTE_SKIP') {
+          const voter = data.sender || conn.peer;
+          this.currentSkipVotes.add(voter);
+          const votesArray = Array.from(this.currentSkipVotes);
+          this.broadcast({ type: 'VOTE_SKIP', skipVotes: votesArray });
+          this.onVoteSkipReceived?.(votesArray);
+        } else if (data.type === 'VOTE_TRACK' && data.trackId) {
+          this.broadcast(data);
+          this.onVoteTrackReceived?.(data.trackId, data.sender || 'Friend');
+        } else if (data.type === 'SYNC_STATE' && (this.auxMode === 'open-aux' || conn.peer === this.activeDjName)) {
+          // Open aux allowed peer playback control
+          this.onSyncReceived?.(data);
+          this.broadcast(data);
         }
       });
     });
@@ -169,6 +225,7 @@ export class RoomSyncService {
       this.onPeersUpdated?.(this.activePeers);
 
       if (departingPeer) {
+        this.currentSkipVotes.delete(departingPeer.name);
         const leaveMsg: RoomMessage = {
           id: `msg-${Date.now()}`,
           sender: 'AuxParty',
@@ -187,6 +244,8 @@ export class RoomSyncService {
     this.roomCode = roomCode.toUpperCase();
     this.userName = guestName || 'Friend';
     this.isHost = false;
+    this.isDJ = false;
+    this.currentSkipVotes.clear();
 
     const hostPeerId = `auxparty-${this.roomCode.toLowerCase()}`;
 
@@ -211,11 +270,28 @@ export class RoomSyncService {
             const data = raw as SyncPayload;
             if (data.type === 'PEER_LIST' && data.peers) {
               this.activePeers = data.peers;
+              if (data.auxMode) this.auxMode = data.auxMode;
+              if (data.activeDjName) {
+                this.activeDjName = data.activeDjName;
+                this.isDJ = this.auxMode === 'open-aux' || this.activeDjName === this.userName;
+              }
               this.onPeersUpdated?.(data.peers);
             } else if (data.type === 'CHAT' && data.message) {
               this.onChatReceived?.(data.message);
             } else if (data.type === 'REACTION' && data.emoji) {
               this.onReactionReceived?.(data.emoji, data.sender || 'Friend');
+            } else if (data.type === 'TRIGGER_SOUND' && data.sound) {
+              this.onSoundTriggered?.(data.sound, data.sender || 'Friend');
+            } else if (data.type === 'VOTE_SKIP' && data.skipVotes) {
+              this.onVoteSkipReceived?.(data.skipVotes);
+            } else if (data.type === 'SET_AUX_MODE' && data.auxMode) {
+              this.auxMode = data.auxMode;
+              this.isDJ = this.auxMode === 'open-aux' || this.activeDjName === this.userName;
+              this.onAuxModeChanged?.(data.auxMode);
+            } else if (data.type === 'TRANSFER_AUX' && data.activeDjName) {
+              this.activeDjName = data.activeDjName;
+              this.isDJ = this.auxMode === 'open-aux' || this.activeDjName === this.userName;
+              this.onDjChanged?.(data.activeDjName, this.isDJ);
             } else {
               this.onSyncReceived?.(data);
             }
@@ -244,7 +320,7 @@ export class RoomSyncService {
     });
   }
 
-  // Broadcast to all peers (if host)
+  // Broadcast to all peers (or host if guest)
   public broadcast(payload: SyncPayload) {
     if (this.isHost) {
       this.connections.forEach((conn) => {
@@ -265,9 +341,9 @@ export class RoomSyncService {
     }
   }
 
-  // Host broadcasts playback change
+  // Broadcast playback state
   public broadcastPlayback(track: Track | null, isPlaying: boolean, position: number, queue: Track[]) {
-    if (!this.isHost) return;
+    if (!this.isHost && this.auxMode !== 'open-aux' && this.activeDjName !== this.userName) return;
     this.broadcast({
       type: 'SYNC_STATE',
       track,
@@ -278,32 +354,72 @@ export class RoomSyncService {
     });
   }
 
+  // Sound effect
+  public triggerSound(sound: SoundEffectType) {
+    if (this.isHost) {
+      this.broadcast({ type: 'TRIGGER_SOUND', sound, sender: this.userName });
+      this.onSoundTriggered?.(sound, this.userName);
+    } else {
+      this.broadcast({ type: 'TRIGGER_SOUND', sound, sender: this.userName });
+    }
+  }
+
+  // Vote to skip
+  public voteSkip() {
+    if (this.isHost) {
+      this.currentSkipVotes.add(this.userName);
+      const votesArray = Array.from(this.currentSkipVotes);
+      this.broadcast({ type: 'VOTE_SKIP', skipVotes: votesArray });
+      this.onVoteSkipReceived?.(votesArray);
+    } else {
+      this.broadcast({ type: 'VOTE_SKIP', sender: this.userName });
+    }
+  }
+
+  // Reset skip votes (e.g. when track changes)
+  public resetSkipVotes() {
+    this.currentSkipVotes.clear();
+    this.broadcast({ type: 'VOTE_SKIP', skipVotes: [] });
+    this.onVoteSkipReceived?.([]);
+  }
+
+  // Toggle Aux Mode (Host only)
+  public setAuxMode(mode: AuxMode) {
+    if (!this.isHost) return;
+    this.auxMode = mode;
+    this.broadcast({ type: 'SET_AUX_MODE', auxMode: mode });
+    this.onAuxModeChanged?.(mode);
+  }
+
+  // Pass the Aux / Delegate DJ (Host only)
+  public transferAux(targetPeerName: string) {
+    if (!this.isHost) return;
+    this.activeDjName = targetPeerName;
+    this.broadcast({ type: 'TRANSFER_AUX', activeDjName: targetPeerName });
+    this.onDjChanged?.(targetPeerName, targetPeerName === this.userName);
+  }
+
   // Request to add a track to the shared room queue
   public requestAddToQueue(track: Track) {
-    if (this.isHost) {
-      // Host adds directly
-      return;
-    }
+    const enrichedTrack = { ...track, addedBy: this.userName, votes: 0 };
+    if (this.isHost) return;
     this.broadcast({
       type: 'REQUEST_ADD_TO_QUEUE',
-      track,
+      track: enrichedTrack,
       sender: this.userName,
     });
   }
 
-  // Request to add multiple tracks (e.g. from Spotify import)
   public requestAddManyToQueue(tracks: Track[]) {
-    if (this.isHost) {
-      return;
-    }
+    const enriched = tracks.map((t) => ({ ...t, addedBy: this.userName, votes: 0 }));
+    if (this.isHost) return;
     this.broadcast({
       type: 'REQUEST_ADD_MANY_TO_QUEUE',
-      tracks,
+      tracks: enriched,
       sender: this.userName,
     });
   }
 
-  // Send chat message
   public sendChatMessage(text: string) {
     const msg: RoomMessage = {
       id: `msg-${Date.now()}-${Math.random()}`,
@@ -319,7 +435,6 @@ export class RoomSyncService {
     }
   }
 
-  // Send emoji reaction
   public sendReaction(emoji: string) {
     if (this.isHost) {
       this.broadcast({ type: 'REACTION', emoji, sender: this.userName });
@@ -329,7 +444,6 @@ export class RoomSyncService {
     }
   }
 
-  // Leave / Destroy
   public leave() {
     this.connections.forEach((c) => c.close());
     this.connections.clear();
@@ -343,7 +457,9 @@ export class RoomSyncService {
     }
     this.activePeers = [];
     this.isHost = false;
+    this.isDJ = false;
     this.roomCode = '';
+    this.currentSkipVotes.clear();
   }
 }
 

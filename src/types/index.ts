@@ -8,6 +8,9 @@ export interface Track {
   image: string;
   streamUrl: string;
   has320?: boolean;
+  addedBy?: string;
+  votes?: number;
+  votedBy?: string[];
 }
 
 export interface SpotifyTrack {
@@ -29,16 +32,24 @@ export interface RoomPeer {
   id: string;
   name: string;
   isHost: boolean;
+  isDJ?: boolean;
+  color?: string;
 }
+
+export type AuxMode = 'host-only' | 'open-aux';
 
 export interface RoomState {
   roomId: string;
   roomCode: string;
   isHost: boolean;
+  isDJ: boolean;
   hostName: string;
+  activeDjName: string;
   userName: string;
   connected: boolean;
   peers: RoomPeer[];
+  auxMode: AuxMode;
+  skipVotes: string[]; // array of peer names/ids who voted to skip
 }
 
 export interface RoomMessage {
@@ -55,5 +66,7 @@ export interface FloatingReaction {
   sender: string;
   x: number;
 }
+
+export type SoundEffectType = 'airhorn' | 'scratch' | 'bassdrop' | 'cheer';
 
 export type PlayMode = 'none' | 'repeat-one' | 'repeat-all';
