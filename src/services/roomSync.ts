@@ -8,15 +8,19 @@ export type SyncEventType =
   | 'SEEK'
   | 'TRACK_CHANGE'
   | 'QUEUE_UPDATE'
+  | 'REQUEST_ADD_TO_QUEUE'
+  | 'REQUEST_ADD_MANY_TO_QUEUE'
   | 'JOIN'
   | 'LEAVE'
   | 'CHAT'
   | 'REACTION'
-  | 'PEER_LIST';
+  | 'PEER_LIST'
+  | 'TRANSFER_AUX';
 
 export interface SyncPayload {
   type: SyncEventType;
   track?: Track | null;
+  tracks?: Track[];
   isPlaying?: boolean;
   position?: number;
   timestamp?: number;
@@ -26,6 +30,7 @@ export interface SyncPayload {
   peers?: RoomPeer[];
   message?: RoomMessage;
   emoji?: string;
+  targetPeerId?: string;
 }
 
 export class RoomSyncService {
@@ -40,15 +45,17 @@ export class RoomSyncService {
   public onPeersUpdated?: (peers: RoomPeer[]) => void;
   public onChatReceived?: (msg: RoomMessage) => void;
   public onReactionReceived?: (emoji: string, sender: string) => void;
+  public onQueueAddRequested?: (track: Track, sender: string) => void;
+  public onQueueAddManyRequested?: (tracks: Track[], sender: string) => void;
   public onError?: (err: string) => void;
 
   private activePeers: RoomPeer[] = [];
 
-  // Generate 6-char room code
-  public static generateRoomCode(): string {
+  // Generate 4-6 char room code (e.g. FG2F or AUX982)
+  public static generateRoomCode(len: number = 4): string {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
     let code = '';
-    for (let i = 0; i < 6; i++) {
+    for (let i = 0; i < len; i++) {
       code += chars.charAt(Math.floor(Math.random() * chars.length));
     }
     return code;
@@ -79,7 +86,7 @@ export class RoomSyncService {
         this.peer.on('error', (err: any) => {
           console.error('Peer host error:', err);
           if (err.type === 'unavailable-id') {
-            this.onError?.('Room code already taken. Try generating a new room code.');
+            this.onError?.('Room code already in use. Try a different code.');
           } else {
             this.onError?.(err.message || 'Connection error occurred');
           }
@@ -134,7 +141,7 @@ export class RoomSyncService {
           const joinMsg: RoomMessage = {
             id: `msg-${Date.now()}-${Math.random()}`,
             sender: 'AuxParty',
-            text: `${peerName} joined the party! 🎉`,
+            text: `${peerName} joined the room! 🎧`,
             timestamp: Date.now(),
             isSystem: true,
           };
@@ -146,6 +153,10 @@ export class RoomSyncService {
         } else if (data.type === 'REACTION' && data.emoji) {
           this.broadcast(data);
           this.onReactionReceived?.(data.emoji, data.sender || 'Friend');
+        } else if (data.type === 'REQUEST_ADD_TO_QUEUE' && data.track) {
+          this.onQueueAddRequested?.(data.track, data.sender || 'Friend');
+        } else if (data.type === 'REQUEST_ADD_MANY_TO_QUEUE' && data.tracks) {
+          this.onQueueAddManyRequested?.(data.tracks, data.sender || 'Friend');
         }
       });
     });
@@ -161,7 +172,7 @@ export class RoomSyncService {
         const leaveMsg: RoomMessage = {
           id: `msg-${Date.now()}`,
           sender: 'AuxParty',
-          text: `${departingPeer.name} left the party.`,
+          text: `${departingPeer.name} left the room.`,
           timestamp: Date.now(),
           isSystem: true,
         };
@@ -211,19 +222,19 @@ export class RoomSyncService {
           });
 
           conn.on('close', () => {
-            this.onError?.('Disconnected from host.');
+            this.onError?.('Disconnected from room host.');
           });
 
           conn.on('error', (err) => {
             console.error('Guest connection error:', err);
-            this.onError?.('Could not connect to host. Make sure the room code is correct.');
+            this.onError?.('Could not find room. Check that the room code is active.');
             resolve(false);
           });
         });
 
         this.peer.on('error', (err) => {
           console.error('Peer guest error:', err);
-          this.onError?.('Unable to connect to room. Check your internet connection.');
+          this.onError?.('Unable to connect to room. Host may be offline.');
           resolve(false);
         });
       } catch (err: any) {
@@ -264,6 +275,31 @@ export class RoomSyncService {
       position,
       timestamp: Date.now(),
       queue,
+    });
+  }
+
+  // Request to add a track to the shared room queue
+  public requestAddToQueue(track: Track) {
+    if (this.isHost) {
+      // Host adds directly
+      return;
+    }
+    this.broadcast({
+      type: 'REQUEST_ADD_TO_QUEUE',
+      track,
+      sender: this.userName,
+    });
+  }
+
+  // Request to add multiple tracks (e.g. from Spotify import)
+  public requestAddManyToQueue(tracks: Track[]) {
+    if (this.isHost) {
+      return;
+    }
+    this.broadcast({
+      type: 'REQUEST_ADD_MANY_TO_QUEUE',
+      tracks,
+      sender: this.userName,
     });
   }
 

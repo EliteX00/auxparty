@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
   X,
   Radio,
@@ -17,6 +18,7 @@ import {
   Loader2,
   AlertCircle,
   Share2,
+  ExternalLink,
 } from 'lucide-react';
 import { useRoom } from '../context/RoomContext';
 
@@ -26,6 +28,7 @@ interface RoomModalProps {
 }
 
 export const RoomModal: React.FC<RoomModalProps> = ({ isOpen, onClose }) => {
+  const navigate = useNavigate();
   const {
     roomState,
     messages,
@@ -43,6 +46,7 @@ export const RoomModal: React.FC<RoomModalProps> = ({ isOpen, onClose }) => {
   const [hostNameInput, setHostNameInput] = useState('');
   const [guestNameInput, setGuestNameInput] = useState('');
   const [roomCodeInput, setRoomCodeInput] = useState('');
+  const [customRoomCode, setCustomRoomCode] = useState('');
   const [chatInput, setChatInput] = useState('');
   const [copied, setCopied] = useState(false);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
@@ -56,14 +60,23 @@ export const RoomModal: React.FC<RoomModalProps> = ({ isOpen, onClose }) => {
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
     clearError();
-    await createRoom(hostNameInput.trim() || 'DJ Host');
+    const code = await createRoom(hostNameInput.trim() || 'DJ Host', customRoomCode.trim() || undefined);
+    if (code) {
+      onClose();
+      navigate(`/room/${code.toLowerCase()}`);
+    }
   };
 
   const handleJoin = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!roomCodeInput.trim()) return;
     clearError();
-    await joinRoom(roomCodeInput.trim(), guestNameInput.trim() || 'Friend');
+    const clean = roomCodeInput.trim().toUpperCase();
+    const success = await joinRoom(clean, guestNameInput.trim() || 'Friend');
+    if (success) {
+      onClose();
+      navigate(`/room/${clean.toLowerCase()}`);
+    }
   };
 
   const handleCopyCode = () => {
@@ -73,10 +86,15 @@ export const RoomModal: React.FC<RoomModalProps> = ({ isOpen, onClose }) => {
   };
 
   const handleCopyLink = () => {
-    const inviteUrl = `${window.location.origin}/?room=${roomState.roomCode}`;
+    const inviteUrl = `${window.location.origin}/room/${roomState.roomCode.toLowerCase()}`;
     navigator.clipboard.writeText(inviteUrl);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+  };
+
+  const handleGoToRoom = () => {
+    onClose();
+    navigate(`/room/${roomState.roomCode.toLowerCase()}`);
   };
 
   const handleSendChat = (e: React.FormEvent) => {
@@ -89,7 +107,7 @@ export const RoomModal: React.FC<RoomModalProps> = ({ isOpen, onClose }) => {
   const emojis = ['🔥', '❤️', '⚡', '🎧', '🚀', '🎉'];
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-md">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-md animate-fade-in">
       <div className="relative w-full max-w-lg bg-zinc-900 border border-zinc-800 rounded-3xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
         {/* Header */}
         <div className="flex items-center justify-between p-6 border-b border-zinc-800">
@@ -99,7 +117,7 @@ export const RoomModal: React.FC<RoomModalProps> = ({ isOpen, onClose }) => {
             </div>
             <div>
               <h3 className="text-lg font-bold text-zinc-100">
-                {roomState.connected ? `Aux Room: ${roomState.roomCode}` : 'Listen With Friends'}
+                {roomState.connected ? `Aux Room: #${roomState.roomCode}` : 'Listen With Friends'}
               </h3>
               <p className="text-xs text-zinc-400">
                 {roomState.connected
@@ -132,20 +150,19 @@ export const RoomModal: React.FC<RoomModalProps> = ({ isOpen, onClose }) => {
               </div>
               <div className="flex gap-2">
                 <button
-                  onClick={handleCopyCode}
-                  className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-purple-600/20 hover:bg-purple-600/30 text-purple-300 border border-purple-500/30 text-xs font-semibold transition-all"
-                  title="Copy code"
-                >
-                  {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                  <span>{copied ? 'Copied' : 'Code'}</span>
-                </button>
-                <button
                   onClick={handleCopyLink}
-                  className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-purple-600 hover:bg-purple-500 text-white text-xs font-bold transition-all shadow-md shadow-purple-600/30"
+                  className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-purple-600/20 hover:bg-purple-600/30 text-purple-300 border border-purple-500/30 text-xs font-semibold transition-all"
                   title="Copy shareable link"
                 >
-                  <Share2 className="w-3.5 h-3.5" />
-                  <span>Share Link</span>
+                  {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                  <span>{copied ? 'Copied' : 'Copy Link'}</span>
+                </button>
+                <button
+                  onClick={handleGoToRoom}
+                  className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-purple-600 hover:bg-purple-500 text-white text-xs font-bold transition-all shadow-md shadow-purple-600/30"
+                >
+                  <span>Open Room Page</span>
+                  <ExternalLink className="w-3.5 h-3.5" />
                 </button>
               </div>
             </div>
@@ -159,7 +176,7 @@ export const RoomModal: React.FC<RoomModalProps> = ({ isOpen, onClose }) => {
                 </span>
                 <span className="text-[11px] text-emerald-400 font-semibold flex items-center gap-1">
                   <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
-                  In Sync
+                  P2P In-Sync
                 </span>
               </div>
 
@@ -173,7 +190,7 @@ export const RoomModal: React.FC<RoomModalProps> = ({ isOpen, onClose }) => {
                     <span className="font-medium">{peer.name}</span>
                     {peer.id === 'host' && (
                       <span className="text-[9px] uppercase px-1 rounded bg-amber-500/20 text-amber-300 font-bold">
-                        Host
+                        DJ Host
                       </span>
                     )}
                   </div>
@@ -200,15 +217,13 @@ export const RoomModal: React.FC<RoomModalProps> = ({ isOpen, onClose }) => {
             </div>
 
             {/* Room Chat */}
-            <div className="flex-1 flex flex-col min-h-[140px] max-h-[220px] bg-zinc-950 rounded-2xl border border-zinc-800/80 overflow-hidden">
+            <div className="flex-1 flex flex-col min-h-[140px] max-h-[200px] bg-zinc-950 rounded-2xl border border-zinc-800/80 overflow-hidden">
               <div className="flex-1 overflow-y-auto p-3 space-y-2 text-xs">
                 {messages.map((m) => (
                   <div
                     key={m.id}
                     className={`flex flex-col ${
-                      m.isSystem
-                        ? 'items-center text-zinc-500 italic py-1'
-                        : 'items-start'
+                      m.isSystem ? 'items-center text-zinc-500 italic py-1' : 'items-start'
                     }`}
                   >
                     {!m.isSystem && (
@@ -249,7 +264,13 @@ export const RoomModal: React.FC<RoomModalProps> = ({ isOpen, onClose }) => {
             </div>
 
             {/* Leave Room Button */}
-            <div className="pt-2 flex justify-end">
+            <div className="pt-2 flex justify-between items-center">
+              <button
+                onClick={handleGoToRoom}
+                className="text-xs text-purple-400 hover:text-purple-300 font-semibold flex items-center gap-1"
+              >
+                Go to Dedicated Room Page →
+              </button>
               <button
                 onClick={() => {
                   leaveRoom();
@@ -258,7 +279,7 @@ export const RoomModal: React.FC<RoomModalProps> = ({ isOpen, onClose }) => {
                 className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-semibold text-red-400 hover:bg-red-500/10 border border-red-500/20 transition-all"
               >
                 <LogOut className="w-3.5 h-3.5" />
-                Leave Party
+                Leave Room
               </button>
             </div>
           </div>
@@ -275,7 +296,7 @@ export const RoomModal: React.FC<RoomModalProps> = ({ isOpen, onClose }) => {
                     : 'text-zinc-400 hover:text-white'
                 }`}
               >
-                Host a Party
+                Create Room
               </button>
               <button
                 onClick={() => setActiveTab('join')}
@@ -313,8 +334,22 @@ export const RoomModal: React.FC<RoomModalProps> = ({ isOpen, onClose }) => {
                   />
                 </div>
 
+                <div>
+                  <label className="text-xs font-semibold text-zinc-400 mb-1.5 block">
+                    Custom Room Code (Optional, e.g. <span className="text-purple-400 font-mono">fg2f</span>)
+                  </label>
+                  <input
+                    type="text"
+                    value={customRoomCode}
+                    onChange={(e) => setCustomRoomCode(e.target.value.toUpperCase())}
+                    maxLength={8}
+                    placeholder="Leave empty for random code"
+                    className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2 text-xs font-mono text-purple-300 placeholder-zinc-700 focus:outline-none focus:border-purple-500 transition-all uppercase"
+                  />
+                </div>
+
                 <div className="p-3.5 rounded-xl bg-purple-950/30 border border-purple-500/20 text-xs text-purple-300 leading-relaxed">
-                  🎧 <strong>You'll be the DJ:</strong> You control the music playback, scrubber, and queue. All your friends will hear the exact same song at the exact same millisecond!
+                  🎧 <strong>Dedicated Room:</strong> You will get a dedicated URL like <code className="bg-purple-900/60 px-1 py-0.5 rounded text-white">/room/fg2f</code> to share with your friends. You can queue songs, import Spotify playlists, and chat live.
                 </div>
 
                 <button
@@ -330,7 +365,7 @@ export const RoomModal: React.FC<RoomModalProps> = ({ isOpen, onClose }) => {
                   ) : (
                     <>
                       <Radio className="w-4 h-4" />
-                      Start Room & Get Invite Code
+                      Start Room & Open Dashboard
                     </>
                   )}
                 </button>
@@ -342,21 +377,21 @@ export const RoomModal: React.FC<RoomModalProps> = ({ isOpen, onClose }) => {
               <form onSubmit={handleJoin} className="space-y-4">
                 <div>
                   <label className="text-xs font-semibold text-zinc-400 mb-1.5 block">
-                    Room Code (6 Characters)
+                    Room Code (e.g. <span className="text-purple-400 font-mono">FG2F</span>)
                   </label>
                   <input
                     type="text"
                     value={roomCodeInput}
                     onChange={(e) => setRoomCodeInput(e.target.value.toUpperCase())}
-                    maxLength={6}
-                    placeholder="e.g. AUX982"
+                    maxLength={8}
+                    placeholder="e.g. FG2F"
                     className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-lg font-mono font-bold tracking-widest text-center text-purple-300 placeholder-zinc-700 focus:outline-none focus:border-purple-500 transition-all uppercase"
                   />
                 </div>
 
                 <div>
                   <label className="text-xs font-semibold text-zinc-400 mb-1.5 block">
-                    Your Name
+                    Your Nickname
                   </label>
                   <input
                     type="text"
@@ -375,12 +410,12 @@ export const RoomModal: React.FC<RoomModalProps> = ({ isOpen, onClose }) => {
                   {isConnecting ? (
                     <>
                       <Loader2 className="w-4 h-4 animate-spin" />
-                      Connecting to Party...
+                      Connecting to Room...
                     </>
                   ) : (
                     <>
                       <Headphones className="w-4 h-4" />
-                      Join Party Now
+                      Join Room & Sync
                     </>
                   )}
                 </button>
