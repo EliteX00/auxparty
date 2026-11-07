@@ -12,7 +12,6 @@ export type SyncEventType =
   | 'REQUEST_ADD_MANY_TO_QUEUE'
   | 'JOIN'
   | 'LEAVE'
-  | 'HEARTBEAT'
   | 'CHAT'
   | 'REACTION'
   | 'PEER_LIST'
@@ -53,16 +52,18 @@ export type StateGetter = () => {
   queue: Track[];
 };
 
-const TOPIC_PREFIX = 'auxparty_v2_';
+const TOPIC_PREFIX = 'auxp3_';
 const PUB_SERVER = 'https://ntfy.sh';
 const WS_SERVER = 'wss://ntfy.sh';
 
 export class RoomSyncService {
   private ws: WebSocket | null = null;
   private es: EventSource | null = null;
+  private bc: BroadcastChannel | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
-  private pruneTimer: ReturnType<typeof setInterval> | null = null;
+  private publishQueueTimer: ReturnType<typeof setTimeout> | null = null;
+  private pendingPublishPayload: SyncPayload | null = null;
+  private lastPublishTime: number = 0;
   private stateGetter: StateGetter | null = null;
 
   public myPeerId: string = '';
@@ -90,7 +91,7 @@ export class RoomSyncService {
   private peerMap: Map<string, { peer: RoomPeer; lastSeen: number }> = new Map();
   public activePeers: RoomPeer[] = [];
   public currentSkipVotes: Set<string> = new Set();
-  private isConnecting: boolean = false;
+  public isConnected: boolean = false;
 
   constructor() {
     if (typeof window !== 'undefined') {
@@ -137,7 +138,7 @@ export class RoomSyncService {
     this.onPeersUpdated?.(this.activePeers);
   }
 
-  // Create room as Host
+  // Create room as Host (instant non-blocking)
   public async createRoom(
     roomCode: string,
     hostName: string,
@@ -155,38 +156,43 @@ export class RoomSyncService {
       this.stateGetter = () => initialState;
     }
 
-    const connected = await this.connectChannel();
-    if (connected) {
-      // Send initial presence and state
+    // Connect in background
+    this.setupBroadcastChannel();
+    this.connectCloudChannel().then(() => {
       this.broadcastSelfPresence('JOIN');
-      const st = this.stateGetter();
-      this.publish({
-        type: 'INIT_SYNC',
-        senderId: this.myPeerId,
-        sender: this.userName,
-        track: st.track,
-        isPlaying: st.isPlaying,
-        position: st.position,
-        timestamp: Date.now(),
-        queue: st.queue,
-        hostName: this.userName,
-        activeDjName: this.userName,
-        auxMode: this.auxMode,
-        peers: this.activePeers,
-      });
-      return true;
-    }
-    return false;
+      const st = this.stateGetter ? this.stateGetter() : null;
+      if (st) {
+        this.publish({
+          type: 'INIT_SYNC',
+          senderId: this.myPeerId,
+          sender: this.userName,
+          track: st.track,
+          isPlaying: st.isPlaying,
+          position: st.position,
+          timestamp: Date.now(),
+          queue: st.queue,
+          hostName: this.userName,
+          activeDjName: this.userName,
+          auxMode: this.auxMode,
+          peers: this.activePeers,
+        });
+      }
+    });
+
+    return true;
   }
 
-  // Join room as Guest
+  // Join room as Guest (instant non-blocking)
   public async joinRoom(roomCode: string, guestName: string): Promise<boolean> {
     this.leave();
     this.roomCode = roomCode.toUpperCase().trim();
     this.initIdentity(guestName, false);
 
-    const connected = await this.connectChannel();
-    if (connected) {
+    // Setup local fast broadcast channel immediately
+    this.setupBroadcastChannel();
+
+    // Connect cloud pubsub in background
+    this.connectCloudChannel().then(() => {
       // Announce join to room
       this.broadcastSelfPresence('JOIN');
       // Request latest playback state from DJ/Host
@@ -195,30 +201,43 @@ export class RoomSyncService {
         senderId: this.myPeerId,
         sender: this.userName,
       });
+    });
 
-      // Also fetch cached recent state from ntfy topic history
-      this.fetchRecentRoomHistory();
+    // If nobody claims DJ within 2.5 seconds, assume DJ role locally
+    setTimeout(() => {
+      if (!this.activeDjName && this.activePeers.length <= 1) {
+        this.isDJ = true;
+        this.activeDjName = this.userName;
+        const myP = this.peerMap.get(this.myPeerId);
+        if (myP) myP.peer.isDJ = true;
+        this.updateActivePeers();
+        this.onDjChanged?.(this.userName, true);
+      }
+    }, 2500);
 
-      // If nobody answers within 2.5 seconds, assume DJ role
-      setTimeout(() => {
-        if (!this.activeDjName && this.activePeers.length <= 1) {
-          this.isDJ = true;
-          this.activeDjName = this.userName;
-          const myP = this.peerMap.get(this.myPeerId);
-          if (myP) myP.peer.isDJ = true;
-          this.updateActivePeers();
-          this.onDjChanged?.(this.userName, true);
+    return true;
+  }
+
+  // Setup BroadcastChannel for 0ms same-origin tab sync
+  private setupBroadcastChannel() {
+    if (typeof window === 'undefined' || typeof BroadcastChannel === 'undefined') return;
+    try {
+      if (this.bc) {
+        this.bc.close();
+      }
+      this.bc = new BroadcastChannel(`auxparty_room_${this.roomCode}`);
+      this.bc.onmessage = (event) => {
+        if (event.data) {
+          this.handleIncomingPayload(event.data);
         }
-      }, 2500);
-
-      return true;
+      };
+    } catch (e) {
+      console.warn('BroadcastChannel not supported:', e);
     }
-    return false;
   }
 
   // Connect to the room pubsub channel using WebSocket (with SSE fallback)
-  private async connectChannel(): Promise<boolean> {
-    this.isConnecting = true;
+  private async connectCloudChannel(): Promise<boolean> {
     const topic = `${TOPIC_PREFIX}${this.roomCode.toLowerCase()}`;
     const wsUrl = `${WS_SERVER}/${topic}/ws`;
 
@@ -228,22 +247,17 @@ export class RoomSyncService {
       const finishConnect = (success: boolean) => {
         if (resolved) return;
         resolved = true;
-        this.isConnecting = false;
-        if (success) {
-          this.startHeartbeat();
-          this.startPruning();
-        }
+        this.isConnected = success;
         resolve(success);
       };
 
-      // Fallback timer: 4 seconds max
+      // 3.5s timeout for WS fallback to SSE
       const fallbackTimer = setTimeout(() => {
         if (!resolved) {
-          console.warn('WebSocket connect slow, starting SSE fallback...');
           this.connectSSE(topic);
           finishConnect(true);
         }
-      }, 4000);
+      }, 3500);
 
       try {
         const ws = new WebSocket(wsUrl);
@@ -266,8 +280,7 @@ export class RoomSyncService {
           }
         };
 
-        ws.onerror = (e) => {
-          console.warn('WebSocket error, falling back to SSE:', e);
+        ws.onerror = () => {
           if (!resolved) {
             clearTimeout(fallbackTimer);
             this.connectSSE(topic);
@@ -276,8 +289,7 @@ export class RoomSyncService {
         };
 
         ws.onclose = () => {
-          // Auto reconnect if not deliberately left
-          if (this.roomCode && !this.isConnecting) {
+          if (this.roomCode) {
             this.scheduleReconnect();
           }
         };
@@ -289,7 +301,7 @@ export class RoomSyncService {
     });
   }
 
-  // SSE Fallback for restricted networks
+  // SSE Fallback
   private connectSSE(topic: string) {
     if (this.es) {
       this.es.close();
@@ -311,7 +323,7 @@ export class RoomSyncService {
       };
 
       es.onerror = () => {
-        // SSE auto-reconnects by default
+        // SSE auto-reconnects natively
       };
     } catch (e) {
       console.error('SSE initialization error:', e);
@@ -322,40 +334,53 @@ export class RoomSyncService {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = setTimeout(() => {
       if (this.roomCode) {
-        this.connectChannel();
+        this.connectCloudChannel();
       }
-    }, 2000);
+    }, 4000);
   }
 
-  // Fetch recent messages to quickly catch up on room state
-  private async fetchRecentRoomHistory() {
+  // Publish message with throttling (never rate-limit)
+  private publish(payload: SyncPayload) {
+    if (!this.roomCode) return;
+
+    // 1. Broadcast locally immediately (0ms latency for same-device tabs)
     try {
-      const topic = `${TOPIC_PREFIX}${this.roomCode.toLowerCase()}`;
-      const res = await fetch(`${PUB_SERVER}/${topic}/json?poll=1&since=5m`, {
-        cache: 'no-store',
-      });
-      if (!res.ok) return;
-      const text = await res.text();
-      const lines = text.trim().split('\n');
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try {
-          const raw = JSON.parse(line);
-          if (raw.event === 'message' && raw.message) {
-            const payload = JSON.parse(raw.message) as SyncPayload;
-            if (payload.type === 'SYNC_STATE' || payload.type === 'INIT_SYNC') {
-              this.handleIncomingPayload(payload);
-            }
+      this.bc?.postMessage(payload);
+    } catch {}
+
+    // 2. Throttle network POSTs to avoid hitting server rate limits
+    const now = Date.now();
+    const MIN_INTERVAL_MS = 1000;
+
+    // High priority events send immediately (e.g. Chat, Queue, Sound, Skip)
+    const isImmediate =
+      payload.type === 'CHAT' ||
+      payload.type === 'TRIGGER_SOUND' ||
+      payload.type === 'VOTE_SKIP' ||
+      payload.type === 'REQUEST_ADD_TO_QUEUE' ||
+      payload.type === 'JOIN' ||
+      payload.type === 'LEAVE';
+
+    if (isImmediate || now - this.lastPublishTime >= MIN_INTERVAL_MS) {
+      this.lastPublishTime = now;
+      this.sendPostPayload(payload);
+    } else {
+      // Debounce the state update (e.g. seeking)
+      this.pendingPublishPayload = payload;
+      if (!this.publishQueueTimer) {
+        this.publishQueueTimer = setTimeout(() => {
+          this.publishQueueTimer = null;
+          if (this.pendingPublishPayload) {
+            this.lastPublishTime = Date.now();
+            this.sendPostPayload(this.pendingPublishPayload);
+            this.pendingPublishPayload = null;
           }
-        } catch {}
+        }, MIN_INTERVAL_MS);
       }
-    } catch (e) {
-      console.warn('Error fetching room history:', e);
     }
   }
 
-  // Publish message to all subscribers in the room
-  private async publish(payload: SyncPayload) {
+  private async sendPostPayload(payload: SyncPayload) {
     if (!this.roomCode) return;
     try {
       const topic = `${TOPIC_PREFIX}${this.roomCode.toLowerCase()}`;
@@ -365,26 +390,11 @@ export class RoomSyncService {
         body: JSON.stringify(payload),
       });
     } catch (e) {
-      console.error('Error publishing to room:', e);
+      console.warn('Publish failed:', e);
     }
   }
 
-  // Periodic heartbeat to maintain live peer list
-  private startHeartbeat() {
-    this.stopHeartbeat();
-    this.heartbeatTimer = setInterval(() => {
-      this.broadcastSelfPresence('HEARTBEAT');
-    }, 4000);
-  }
-
-  private stopHeartbeat() {
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
-    }
-  }
-
-  private broadcastSelfPresence(type: 'JOIN' | 'HEARTBEAT') {
+  private broadcastSelfPresence(type: 'JOIN') {
     const myPeer: RoomPeer = {
       id: this.myPeerId,
       name: this.userName,
@@ -402,45 +412,6 @@ export class RoomSyncService {
     });
   }
 
-  // Remove peers who have been silent for more than 10 seconds
-  private startPruning() {
-    this.stopPruning();
-    this.pruneTimer = setInterval(() => {
-      const now = Date.now();
-      let changed = false;
-      for (const [id, data] of this.peerMap.entries()) {
-        if (id === this.myPeerId) continue;
-        if (now - data.lastSeen > 10000) {
-          this.peerMap.delete(id);
-          changed = true;
-          this.currentSkipVotes.delete(data.peer.name);
-        }
-      }
-      if (changed) {
-        this.updateActivePeers();
-        // If current DJ went offline, and I am host or the oldest peer, claim DJ
-        if (
-          this.activeDjName &&
-          !this.activePeers.some((p) => p.name === this.activeDjName)
-        ) {
-          this.isDJ = true;
-          this.activeDjName = this.userName;
-          const me = this.peerMap.get(this.myPeerId);
-          if (me) me.peer.isDJ = true;
-          this.updateActivePeers();
-          this.onDjChanged?.(this.userName, true);
-        }
-      }
-    }, 3000);
-  }
-
-  private stopPruning() {
-    if (this.pruneTimer) {
-      clearInterval(this.pruneTimer);
-      this.pruneTimer = null;
-    }
-  }
-
   // Process incoming payloads from room subscribers
   private handleIncomingPayload(payload: SyncPayload) {
     // Ignore our own broadcast messages
@@ -449,8 +420,7 @@ export class RoomSyncService {
     }
 
     switch (payload.type) {
-      case 'JOIN':
-      case 'HEARTBEAT': {
+      case 'JOIN': {
         if (payload.peer && payload.peer.id) {
           const isNew = !this.peerMap.has(payload.peer.id);
           this.peerMap.set(payload.peer.id, {
@@ -465,7 +435,7 @@ export class RoomSyncService {
             this.isDJ = this.auxMode === 'open-aux' || this.activeDjName === this.userName;
           }
 
-          if (isNew && payload.type === 'JOIN') {
+          if (isNew) {
             const joinMsg: RoomMessage = {
               id: `msg-${Date.now()}-${Math.random()}`,
               sender: 'AuxParty',
@@ -490,6 +460,7 @@ export class RoomSyncService {
                   queue: st.queue,
                   activeDjName: this.activeDjName,
                   auxMode: this.auxMode,
+                  peers: this.activePeers,
                 });
               }
             }
@@ -533,6 +504,7 @@ export class RoomSyncService {
               queue: st.queue,
               activeDjName: this.activeDjName,
               auxMode: this.auxMode,
+              peers: this.activePeers,
             });
           }
         }
@@ -547,6 +519,14 @@ export class RoomSyncService {
         }
         if (payload.auxMode) {
           this.auxMode = payload.auxMode;
+        }
+        if (payload.peers && payload.peers.length > 0) {
+          payload.peers.forEach((p) => {
+            if (p.id) {
+              this.peerMap.set(p.id, { peer: p, lastSeen: Date.now() });
+            }
+          });
+          this.updateActivePeers();
         }
         this.onSyncReceived?.(payload);
         break;
@@ -748,17 +728,15 @@ export class RoomSyncService {
   }
 
   public broadcast(payload: SyncPayload) {
-    payload.senderId = this.myPeerId;
-    payload.sender = this.userName;
-    this.publish(payload);
-  }
-
-  public abortJoin() {
-    this.leave();
+    this.publish({
+      ...payload,
+      senderId: this.myPeerId,
+      sender: this.userName,
+    });
   }
 
   private sendLeaveBeacon() {
-    if (!this.roomCode || !this.myPeerId) return;
+    if (!this.roomCode) return;
     try {
       const topic = `${TOPIC_PREFIX}${this.roomCode.toLowerCase()}`;
       const payload: SyncPayload = {
@@ -774,36 +752,43 @@ export class RoomSyncService {
   }
 
   public leave() {
-    this.sendLeaveBeacon();
-    this.stopHeartbeat();
-    this.stopPruning();
-
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
+    if (this.roomCode) {
+      this.publish({
+        type: 'LEAVE',
+        senderId: this.myPeerId,
+        peerId: this.myPeerId,
+        sender: this.userName,
+      });
     }
 
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    if (this.publishQueueTimer) clearTimeout(this.publishQueueTimer);
+    this.publishQueueTimer = null;
+    this.pendingPublishPayload = null;
+
     if (this.ws) {
-      try {
-        this.ws.close();
-      } catch {}
+      this.ws.onclose = null;
+      this.ws.close();
       this.ws = null;
     }
 
     if (this.es) {
-      try {
-        this.es.close();
-      } catch {}
+      this.es.close();
       this.es = null;
     }
 
-    this.peerMap.clear();
-    this.activePeers = [];
+    if (this.bc) {
+      this.bc.close();
+      this.bc = null;
+    }
+
+    this.roomCode = '';
     this.isHost = false;
     this.isDJ = false;
-    this.roomCode = '';
+    this.isConnected = false;
+    this.peerMap.clear();
+    this.activePeers = [];
     this.currentSkipVotes.clear();
-    this.stateGetter = null;
   }
 }
 

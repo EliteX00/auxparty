@@ -168,6 +168,16 @@ export const RoomPage: React.FC = () => {
     }, 300);
   }, [roomSearchQuery]);
 
+  // Auto-join room on mount if nickname is already saved
+  useEffect(() => {
+    if (targetCode && (!roomState.connected || roomState.roomCode !== targetCode)) {
+      const saved = localStorage.getItem('auxparty_nickname');
+      if (saved && saved.trim()) {
+        joinRoom(targetCode, saved.trim());
+      }
+    }
+  }, [targetCode]);
+
   const handleExit = () => {
     leaveRoom();
     navigate('/');
@@ -177,12 +187,20 @@ export const RoomPage: React.FC = () => {
     e.preventDefault();
     if (!targetCode) return;
     clearError();
-    await joinRoom(targetCode, userNameInput.trim() || 'Friend');
+    const name = userNameInput.trim() || 'Friend';
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('auxparty_nickname', name);
+    }
+    await joinRoom(targetCode, name);
   };
 
   const handleCreateThisRoom = async () => {
     clearError();
-    await createRoom(userNameInput.trim() || 'DJ Host', targetCode);
+    const name = userNameInput.trim() || 'DJ Host';
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('auxparty_nickname', name);
+    }
+    await createRoom(name, targetCode);
   };
 
   const handleCopyLink = () => {
@@ -302,31 +320,11 @@ export const RoomPage: React.FC = () => {
 
             <button
               type="submit"
-              disabled={isConnecting}
-              className="w-full py-3.5 rounded-xl bg-gradient-to-r from-purple-600 via-indigo-600 to-pink-600 hover:from-purple-500 hover:to-pink-500 text-white font-bold text-sm shadow-xl shadow-purple-600/40 hover:scale-[1.02] active:scale-95 transition-all flex items-center justify-center gap-2 disabled:opacity-50 border border-white/20"
+              className="w-full py-3.5 rounded-xl bg-gradient-to-r from-purple-600 via-indigo-600 to-pink-600 hover:from-purple-500 hover:to-pink-500 text-white font-bold text-sm shadow-xl shadow-purple-600/40 hover:scale-[1.02] active:scale-95 transition-all flex items-center justify-center gap-2 border border-white/20"
             >
-              {isConnecting ? (
-                <>
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                  Connecting to #{targetCode}...
-                </>
-              ) : (
-                <>
-                  <Headphones className="w-4 h-4" />
-                  Join Room Now
-                </>
-              )}
+              <Headphones className="w-4 h-4" />
+              Join Room #{targetCode} Now
             </button>
-
-            {isConnecting && (
-              <button
-                type="button"
-                onClick={cancelConnecting}
-                className="w-full py-1.5 text-xs font-medium text-zinc-400 hover:text-white transition-colors"
-              >
-                Cancel connecting
-              </button>
-            )}
           </form>
 
           <div className="pt-2 text-center border-t border-white/5">

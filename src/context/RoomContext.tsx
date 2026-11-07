@@ -340,7 +340,7 @@ export const RoomProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   const cancelConnecting = () => {
-    roomSync.abortJoin();
+    roomSync.leave();
     setIsConnecting(false);
     setError(null);
   };

@@ -13,6 +13,14 @@
       "destination": "/api/spotify.js"
     },
     {
+      "source": "/api/recommendations",
+      "destination": "/api/recommendations.js"
+    },
+    {
+      "source": "/api/youtube",
+      "destination": "/api/youtube.js"
+    },
+    {
       "source": "/(.*)",
       "destination": "/index.html"
     }
