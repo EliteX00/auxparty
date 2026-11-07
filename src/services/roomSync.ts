@@ -1,9 +1,9 @@
-import { Peer, DataConnection, PeerOptions } from 'peerjs';
 import { Track, RoomPeer, RoomMessage, AuxMode, SoundEffectType } from '../types';
 
 export type SyncEventType =
   | 'INIT_SYNC'
   | 'SYNC_STATE'
+  | 'REQUEST_STATE'
   | 'PLAY_PAUSE'
   | 'SEEK'
   | 'TRACK_CHANGE'
@@ -12,6 +12,7 @@ export type SyncEventType =
   | 'REQUEST_ADD_MANY_TO_QUEUE'
   | 'JOIN'
   | 'LEAVE'
+  | 'HEARTBEAT'
   | 'CHAT'
   | 'REACTION'
   | 'PEER_LIST'
@@ -23,6 +24,11 @@ export type SyncEventType =
 
 export interface SyncPayload {
   type: SyncEventType;
+  senderId?: string;
+  sender?: string;
+  peer?: RoomPeer;
+  peers?: RoomPeer[];
+  peerId?: string;
   track?: Track | null;
   tracks?: Track[];
   isPlaying?: boolean;
@@ -31,8 +37,6 @@ export interface SyncPayload {
   queue?: Track[];
   hostName?: string;
   activeDjName?: string;
-  sender?: string;
-  peers?: RoomPeer[];
   message?: RoomMessage;
   emoji?: string;
   sound?: SoundEffectType;
@@ -49,37 +53,24 @@ export type StateGetter = () => {
   queue: Track[];
 };
 
-export const DEFAULT_PEER_OPTIONS: PeerOptions = {
-  debug: 1,
-  config: {
-    iceServers: [
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun1.l.google.com:19302' },
-      { urls: 'stun:stun2.l.google.com:19302' },
-      { urls: 'stun:stun3.l.google.com:19302' },
-      { urls: 'stun:stun4.l.google.com:19302' },
-      { urls: 'stun:stun.cloudflare.com:3478' },
-      {
-        urls: [
-          'turn:relay.metered.ca:80',
-          'turn:relay.metered.ca:80?transport=tcp',
-        ],
-        username: 'openrelayproject',
-        credential: 'openrelayproject',
-      },
-    ],
-    iceCandidatePoolSize: 10,
-  },
-};
+const TOPIC_PREFIX = 'auxparty_v2_';
+const PUB_SERVER = 'https://ntfy.sh';
+const WS_SERVER = 'wss://ntfy.sh';
 
 export class RoomSyncService {
-  private peer: Peer | null = null;
-  private connections: Map<string, DataConnection> = new Map();
-  private hostConnection: DataConnection | null = null;
+  private ws: WebSocket | null = null;
+  private es: EventSource | null = null;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private pruneTimer: ReturnType<typeof setInterval> | null = null;
+  private stateGetter: StateGetter | null = null;
+
+  public myPeerId: string = '';
   public isHost: boolean = false;
   public isDJ: boolean = false;
   public roomCode: string = '';
   public userName: string = '';
+  public userColor: string = '#8b5cf6';
   public auxMode: AuxMode = 'host-only';
   public activeDjName: string = '';
 
@@ -96,14 +87,15 @@ export class RoomSyncService {
   public onDjChanged?: (djName: string, isMe: boolean) => void;
   public onError?: (err: string) => void;
 
-  private activePeers: RoomPeer[] = [];
+  private peerMap: Map<string, { peer: RoomPeer; lastSeen: number }> = new Map();
+  public activePeers: RoomPeer[] = [];
   public currentSkipVotes: Set<string> = new Set();
-  private connectionTimeoutId: ReturnType<typeof setTimeout> | null = null;
+  private isConnecting: boolean = false;
 
   constructor() {
     if (typeof window !== 'undefined') {
       window.addEventListener('beforeunload', () => {
-        this.leave();
+        this.sendLeaveBeacon();
       });
     }
   }
@@ -117,6 +109,34 @@ export class RoomSyncService {
     return code;
   }
 
+  private initIdentity(name: string, isHostRole: boolean) {
+    this.myPeerId = `peer_${Math.random().toString(36).substring(2, 9)}_${Date.now().toString(36)}`;
+    const colors = ['#8b5cf6', '#ec4899', '#3b82f6', '#10b981', '#f59e0b', '#06b6d4'];
+    this.userColor = colors[Math.floor(Math.random() * colors.length)];
+    this.userName = name || (isHostRole ? 'DJ (Host)' : 'Friend');
+    this.isHost = isHostRole;
+    this.isDJ = isHostRole;
+    this.activeDjName = isHostRole ? this.userName : '';
+    this.auxMode = 'host-only';
+    this.currentSkipVotes.clear();
+    this.peerMap.clear();
+
+    const myPeer: RoomPeer = {
+      id: this.myPeerId,
+      name: this.userName,
+      isHost: this.isHost,
+      isDJ: this.isDJ,
+      color: this.userColor,
+    };
+    this.peerMap.set(this.myPeerId, { peer: myPeer, lastSeen: Date.now() });
+    this.updateActivePeers();
+  }
+
+  private updateActivePeers() {
+    this.activePeers = Array.from(this.peerMap.values()).map((p) => p.peer);
+    this.onPeersUpdated?.(this.activePeers);
+  }
+
   // Create room as Host
   public async createRoom(
     roomCode: string,
@@ -126,446 +146,576 @@ export class RoomSyncService {
       | StateGetter
   ): Promise<boolean> {
     this.leave();
-
     this.roomCode = roomCode.toUpperCase().trim();
-    this.userName = hostName || 'DJ (Host)';
-    this.isHost = true;
-    this.isDJ = true;
-    this.activeDjName = this.userName;
-    this.auxMode = 'host-only';
-    this.currentSkipVotes.clear();
+    this.initIdentity(hostName, true);
 
-    const colors = ['#8b5cf6', '#ec4899', '#3b82f6', '#10b981', '#f59e0b', '#06b6d4'];
-    this.activePeers = [
-      {
-        id: 'host',
-        name: this.userName,
-        isHost: true,
-        isDJ: true,
-        color: colors[0],
-      },
-    ];
+    if (typeof initialState === 'function') {
+      this.stateGetter = initialState;
+    } else {
+      this.stateGetter = () => initialState;
+    }
 
-    const peerId = `auxparty-${this.roomCode.toLowerCase()}`;
-
-    return new Promise((resolve) => {
-      let resolved = false;
-
-      const finish = (success: boolean, errorMsg?: string) => {
-        if (resolved) return;
-        resolved = true;
-        if (this.connectionTimeoutId) {
-          clearTimeout(this.connectionTimeoutId);
-          this.connectionTimeoutId = null;
-        }
-        if (!success) {
-          if (errorMsg) this.onError?.(errorMsg);
-          this.leave();
-        }
-        resolve(success);
-      };
-
-      this.connectionTimeoutId = setTimeout(() => {
-        finish(
-          false,
-          `Timed out starting room #${this.roomCode}. Signaling server may be busy, please try again.`
-        );
-      }, 10000);
-
-      try {
-        const peer = new Peer(peerId, DEFAULT_PEER_OPTIONS);
-        this.peer = peer;
-
-        peer.on('open', () => {
-          this.onPeersUpdated?.(this.activePeers);
-          finish(true);
-        });
-
-        peer.on('error', (err: any) => {
-          console.error('Peer host error:', err);
-          if (err.type === 'unavailable-id') {
-            finish(
-              false,
-              `Room #${this.roomCode} is already active or was recently hosted. Please wait a moment or try another code.`
-            );
-          } else if (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error') {
-            finish(
-              false,
-              'Unable to reach peer signaling server. If you are using Brave or an adblocker, allow WebSockets for this site.'
-            );
-          } else {
-            finish(false, err.message || 'Connection error occurred while starting the room.');
-          }
-        });
-
-        peer.on('connection', (conn) => {
-          this.handleIncomingConnection(conn, initialState);
-        });
-      } catch (e: any) {
-        finish(false, e.message || 'Failed to initialize room');
-      }
-    });
-  }
-
-  // Handle a guest connecting to the host
-  private handleIncomingConnection(
-    conn: DataConnection,
-    initialState:
-      | { track: Track | null; isPlaying: boolean; position: number; queue: Track[] }
-      | StateGetter
-  ) {
-    conn.on('open', () => {
-      this.connections.set(conn.peer, conn);
-
-      conn.on('data', (raw: any) => {
-        const data = raw as SyncPayload;
-        if (data.type === 'JOIN') {
-          const peerName = data.sender || 'Friend';
-          const colors = ['#8b5cf6', '#ec4899', '#3b82f6', '#10b981', '#f59e0b', '#06b6d4'];
-          const newPeer: RoomPeer = {
-            id: conn.peer,
-            name: peerName,
-            isHost: false,
-            isDJ: this.auxMode === 'open-aux',
-            color: colors[this.activePeers.length % colors.length],
-          };
-          this.activePeers = [...this.activePeers.filter((p) => p.id !== conn.peer), newPeer];
-
-          this.broadcast({
-            type: 'PEER_LIST',
-            peers: this.activePeers,
-            activeDjName: this.activeDjName,
-            auxMode: this.auxMode,
-          });
-          this.onPeersUpdated?.(this.activePeers);
-
-          const currentState = typeof initialState === 'function' ? initialState() : initialState;
-          conn.send({
-            type: 'INIT_SYNC',
-            track: currentState.track,
-            isPlaying: currentState.isPlaying,
-            position: currentState.position,
-            timestamp: Date.now(),
-            queue: currentState.queue,
-            hostName: this.userName,
-            activeDjName: this.activeDjName,
-            peers: this.activePeers,
-            auxMode: this.auxMode,
-            skipVotes: Array.from(this.currentSkipVotes),
-          } as SyncPayload);
-
-          const joinMsg: RoomMessage = {
-            id: `msg-${Date.now()}-${Math.random()}`,
-            sender: 'AuxParty',
-            text: `${peerName} joined the room! 🎧`,
-            timestamp: Date.now(),
-            isSystem: true,
-          };
-          this.broadcast({ type: 'CHAT', message: joinMsg });
-          this.onChatReceived?.(joinMsg);
-        } else if (data.type === 'CHAT' && data.message) {
-          this.broadcast(data);
-          this.onChatReceived?.(data.message);
-        } else if (data.type === 'REACTION' && data.emoji) {
-          this.broadcast(data);
-          this.onReactionReceived?.(data.emoji, data.sender || 'Friend');
-        } else if (data.type === 'TRIGGER_SOUND' && data.sound) {
-          this.broadcast(data);
-          this.onSoundTriggered?.(data.sound, data.sender || 'Friend');
-        } else if (data.type === 'REQUEST_ADD_TO_QUEUE' && data.track) {
-          this.onQueueAddRequested?.(data.track, data.sender || 'Friend');
-        } else if (data.type === 'REQUEST_ADD_MANY_TO_QUEUE' && data.tracks) {
-          this.onQueueAddManyRequested?.(data.tracks, data.sender || 'Friend');
-        } else if (data.type === 'VOTE_SKIP') {
-          const voter = data.sender || conn.peer;
-          this.currentSkipVotes.add(voter);
-          const votesArray = Array.from(this.currentSkipVotes);
-          this.broadcast({ type: 'VOTE_SKIP', skipVotes: votesArray });
-          this.onVoteSkipReceived?.(votesArray);
-        } else if (data.type === 'VOTE_TRACK' && data.trackId) {
-          this.broadcast(data);
-          this.onVoteTrackReceived?.(data.trackId, data.sender || 'Friend');
-        } else if (data.type === 'SYNC_STATE' && (this.auxMode === 'open-aux' || conn.peer === this.activeDjName)) {
-          // Open aux allowed peer playback control
-          this.onSyncReceived?.(data);
-          this.broadcast(data);
-        }
+    const connected = await this.connectChannel();
+    if (connected) {
+      // Send initial presence and state
+      this.broadcastSelfPresence('JOIN');
+      const st = this.stateGetter();
+      this.publish({
+        type: 'INIT_SYNC',
+        senderId: this.myPeerId,
+        sender: this.userName,
+        track: st.track,
+        isPlaying: st.isPlaying,
+        position: st.position,
+        timestamp: Date.now(),
+        queue: st.queue,
+        hostName: this.userName,
+        activeDjName: this.userName,
+        auxMode: this.auxMode,
+        peers: this.activePeers,
       });
-    });
-
-    conn.on('close', () => {
-      this.connections.delete(conn.peer);
-      const departingPeer = this.activePeers.find((p) => p.id === conn.peer);
-      this.activePeers = this.activePeers.filter((p) => p.id !== conn.peer);
-      this.broadcast({ type: 'PEER_LIST', peers: this.activePeers });
-      this.onPeersUpdated?.(this.activePeers);
-
-      if (departingPeer) {
-        this.currentSkipVotes.delete(departingPeer.name);
-        const leaveMsg: RoomMessage = {
-          id: `msg-${Date.now()}`,
-          sender: 'AuxParty',
-          text: `${departingPeer.name} left the room.`,
-          timestamp: Date.now(),
-          isSystem: true,
-        };
-        this.broadcast({ type: 'CHAT', message: leaveMsg });
-        this.onChatReceived?.(leaveMsg);
-      }
-    });
+      return true;
+    }
+    return false;
   }
 
   // Join room as Guest
   public async joinRoom(roomCode: string, guestName: string): Promise<boolean> {
     this.leave();
-
     this.roomCode = roomCode.toUpperCase().trim();
-    this.userName = guestName || 'Friend';
-    this.isHost = false;
-    this.isDJ = false;
-    this.currentSkipVotes.clear();
+    this.initIdentity(guestName, false);
 
-    const hostPeerId = `auxparty-${this.roomCode.toLowerCase()}`;
+    const connected = await this.connectChannel();
+    if (connected) {
+      // Announce join to room
+      this.broadcastSelfPresence('JOIN');
+      // Request latest playback state from DJ/Host
+      this.publish({
+        type: 'REQUEST_STATE',
+        senderId: this.myPeerId,
+        sender: this.userName,
+      });
+
+      // Also fetch cached recent state from ntfy topic history
+      this.fetchRecentRoomHistory();
+
+      // If nobody answers within 2.5 seconds, assume DJ role
+      setTimeout(() => {
+        if (!this.activeDjName && this.activePeers.length <= 1) {
+          this.isDJ = true;
+          this.activeDjName = this.userName;
+          const myP = this.peerMap.get(this.myPeerId);
+          if (myP) myP.peer.isDJ = true;
+          this.updateActivePeers();
+          this.onDjChanged?.(this.userName, true);
+        }
+      }, 2500);
+
+      return true;
+    }
+    return false;
+  }
+
+  // Connect to the room pubsub channel using WebSocket (with SSE fallback)
+  private async connectChannel(): Promise<boolean> {
+    this.isConnecting = true;
+    const topic = `${TOPIC_PREFIX}${this.roomCode.toLowerCase()}`;
+    const wsUrl = `${WS_SERVER}/${topic}/ws`;
 
     return new Promise((resolve) => {
       let resolved = false;
 
-      const finish = (success: boolean, errorMsg?: string) => {
+      const finishConnect = (success: boolean) => {
         if (resolved) return;
         resolved = true;
-        if (this.connectionTimeoutId) {
-          clearTimeout(this.connectionTimeoutId);
-          this.connectionTimeoutId = null;
-        }
-        if (!success) {
-          if (errorMsg) this.onError?.(errorMsg);
-          this.leave();
+        this.isConnecting = false;
+        if (success) {
+          this.startHeartbeat();
+          this.startPruning();
         }
         resolve(success);
       };
 
-      // 10-second timeout: never leave the user hanging
-      this.connectionTimeoutId = setTimeout(() => {
-        finish(
-          false,
-          `Connection timed out. Room #${this.roomCode} may be offline or no host is currently active.`
-        );
-      }, 10000);
+      // Fallback timer: 4 seconds max
+      const fallbackTimer = setTimeout(() => {
+        if (!resolved) {
+          console.warn('WebSocket connect slow, starting SSE fallback...');
+          this.connectSSE(topic);
+          finishConnect(true);
+        }
+      }, 4000);
 
       try {
-        const peer = new Peer(DEFAULT_PEER_OPTIONS);
-        this.peer = peer;
+        const ws = new WebSocket(wsUrl);
+        this.ws = ws;
 
-        peer.on('open', () => {
-          if (resolved || this.peer !== peer) return;
+        ws.onopen = () => {
+          clearTimeout(fallbackTimer);
+          finishConnect(true);
+        };
 
+        ws.onmessage = (event) => {
           try {
-            const conn = peer.connect(hostPeerId, { reliable: true });
-            this.hostConnection = conn;
-
-            // Monitor WebRTC connection states
-            if (conn.peerConnection) {
-              const pc = conn.peerConnection;
-              pc.oniceconnectionstatechange = () => {
-                if (pc.iceConnectionState === 'failed') {
-                  finish(
-                    false,
-                    `Direct P2P connection failed to reach Room #${this.roomCode}. Network or firewall may be restricting WebRTC.`
-                  );
-                }
-              };
-              pc.onconnectionstatechange = () => {
-                if (pc.connectionState === 'failed') {
-                  finish(false, `WebRTC connection failed. Host may have gone offline.`);
-                }
-              };
+            const raw = JSON.parse(event.data);
+            if (raw.event === 'message' && raw.message) {
+              const payload = JSON.parse(raw.message) as SyncPayload;
+              this.handleIncomingPayload(payload);
             }
-
-            conn.on('open', () => {
-              if (resolved) return;
-              try {
-                conn.send({
-                  type: 'JOIN',
-                  sender: this.userName,
-                } as SyncPayload);
-              } catch (e) {
-                console.error('Error sending JOIN payload:', e);
-              }
-              finish(true);
-            });
-
-            conn.on('data', (raw: any) => {
-              const data = raw as SyncPayload;
-              if (data.type === 'PEER_LIST' && data.peers) {
-                this.activePeers = data.peers;
-                if (data.auxMode) this.auxMode = data.auxMode;
-                if (data.activeDjName) {
-                  this.activeDjName = data.activeDjName;
-                  this.isDJ = this.auxMode === 'open-aux' || this.activeDjName === this.userName;
-                }
-                this.onPeersUpdated?.(data.peers);
-              } else if (data.type === 'CHAT' && data.message) {
-                this.onChatReceived?.(data.message);
-              } else if (data.type === 'REACTION' && data.emoji) {
-                this.onReactionReceived?.(data.emoji, data.sender || 'Friend');
-              } else if (data.type === 'TRIGGER_SOUND' && data.sound) {
-                this.onSoundTriggered?.(data.sound, data.sender || 'Friend');
-              } else if (data.type === 'VOTE_SKIP' && data.skipVotes) {
-                this.onVoteSkipReceived?.(data.skipVotes);
-              } else if (data.type === 'SET_AUX_MODE' && data.auxMode) {
-                this.auxMode = data.auxMode;
-                this.isDJ = this.auxMode === 'open-aux' || this.activeDjName === this.userName;
-                this.onAuxModeChanged?.(data.auxMode);
-              } else if (data.type === 'TRANSFER_AUX' && data.activeDjName) {
-                this.activeDjName = data.activeDjName;
-                this.isDJ = this.auxMode === 'open-aux' || this.activeDjName === this.userName;
-                this.onDjChanged?.(data.activeDjName, this.isDJ);
-              } else {
-                this.onSyncReceived?.(data);
-              }
-            });
-
-            conn.on('close', () => {
-              this.onError?.('Disconnected from room host.');
-              this.leave();
-            });
-
-            conn.on('error', (err: any) => {
-              console.error('Guest connection error:', err);
-              finish(false, `Could not find room #${this.roomCode}. Check that the room code is active.`);
-            });
-          } catch (e: any) {
-            console.error('Error connecting to host peer:', e);
-            finish(false, e.message || 'Failed to initiate connection with host.');
+          } catch (e) {
+            console.error('Error parsing room message:', e);
           }
-        });
+        };
 
-        peer.on('error', (err: any) => {
-          console.error('Peer guest error:', err);
-          if (err.type === 'peer-unavailable') {
-            finish(
-              false,
-              `Room #${this.roomCode} was not found or the host is offline. You can start this room as Host / DJ.`
-            );
-          } else if (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error') {
-            finish(
-              false,
-              'Signaling connection error. If you are using Brave or an adblocker, allow WebSockets/WebRTC, or check your internet connection.'
-            );
-          } else {
-            finish(false, err.message || 'Unable to connect to room. Host may be offline.');
+        ws.onerror = (e) => {
+          console.warn('WebSocket error, falling back to SSE:', e);
+          if (!resolved) {
+            clearTimeout(fallbackTimer);
+            this.connectSSE(topic);
+            finishConnect(true);
           }
-        });
+        };
+
+        ws.onclose = () => {
+          // Auto reconnect if not deliberately left
+          if (this.roomCode && !this.isConnecting) {
+            this.scheduleReconnect();
+          }
+        };
       } catch (err: any) {
-        finish(false, err.message || 'Failed to join room');
+        clearTimeout(fallbackTimer);
+        this.connectSSE(topic);
+        finishConnect(true);
       }
     });
   }
 
-  // Cancel any in-progress connection attempt
-  public abortJoin() {
-    if (this.connectionTimeoutId) {
-      clearTimeout(this.connectionTimeoutId);
-      this.connectionTimeoutId = null;
+  // SSE Fallback for restricted networks
+  private connectSSE(topic: string) {
+    if (this.es) {
+      this.es.close();
+      this.es = null;
     }
-    this.leave();
+    try {
+      const sseUrl = `${PUB_SERVER}/${topic}/sse`;
+      const es = new EventSource(sseUrl);
+      this.es = es;
+
+      es.onmessage = (event) => {
+        try {
+          const raw = JSON.parse(event.data);
+          if (raw.event === 'message' && raw.message) {
+            const payload = JSON.parse(raw.message) as SyncPayload;
+            this.handleIncomingPayload(payload);
+          }
+        } catch (e) {}
+      };
+
+      es.onerror = () => {
+        // SSE auto-reconnects by default
+      };
+    } catch (e) {
+      console.error('SSE initialization error:', e);
+    }
   }
 
-  // Broadcast to all peers (or host if guest)
-  public broadcast(payload: SyncPayload) {
-    if (this.isHost) {
-      this.connections.forEach((conn) => {
-        if (conn.open) {
-          try {
-            conn.send(payload);
-          } catch (e) {
-            console.error('Broadcast send error:', e);
+  private scheduleReconnect() {
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = setTimeout(() => {
+      if (this.roomCode) {
+        this.connectChannel();
+      }
+    }, 2000);
+  }
+
+  // Fetch recent messages to quickly catch up on room state
+  private async fetchRecentRoomHistory() {
+    try {
+      const topic = `${TOPIC_PREFIX}${this.roomCode.toLowerCase()}`;
+      const res = await fetch(`${PUB_SERVER}/${topic}/json?poll=1&since=5m`, {
+        cache: 'no-store',
+      });
+      if (!res.ok) return;
+      const text = await res.text();
+      const lines = text.trim().split('\n');
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const raw = JSON.parse(line);
+          if (raw.event === 'message' && raw.message) {
+            const payload = JSON.parse(raw.message) as SyncPayload;
+            if (payload.type === 'SYNC_STATE' || payload.type === 'INIT_SYNC') {
+              this.handleIncomingPayload(payload);
+            }
+          }
+        } catch {}
+      }
+    } catch (e) {
+      console.warn('Error fetching room history:', e);
+    }
+  }
+
+  // Publish message to all subscribers in the room
+  private async publish(payload: SyncPayload) {
+    if (!this.roomCode) return;
+    try {
+      const topic = `${TOPIC_PREFIX}${this.roomCode.toLowerCase()}`;
+      await fetch(`${PUB_SERVER}/${topic}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+    } catch (e) {
+      console.error('Error publishing to room:', e);
+    }
+  }
+
+  // Periodic heartbeat to maintain live peer list
+  private startHeartbeat() {
+    this.stopHeartbeat();
+    this.heartbeatTimer = setInterval(() => {
+      this.broadcastSelfPresence('HEARTBEAT');
+    }, 4000);
+  }
+
+  private stopHeartbeat() {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  }
+
+  private broadcastSelfPresence(type: 'JOIN' | 'HEARTBEAT') {
+    const myPeer: RoomPeer = {
+      id: this.myPeerId,
+      name: this.userName,
+      isHost: this.isHost,
+      isDJ: this.isDJ,
+      color: this.userColor,
+    };
+    this.publish({
+      type,
+      senderId: this.myPeerId,
+      sender: this.userName,
+      peer: myPeer,
+      activeDjName: this.activeDjName,
+      auxMode: this.auxMode,
+    });
+  }
+
+  // Remove peers who have been silent for more than 10 seconds
+  private startPruning() {
+    this.stopPruning();
+    this.pruneTimer = setInterval(() => {
+      const now = Date.now();
+      let changed = false;
+      for (const [id, data] of this.peerMap.entries()) {
+        if (id === this.myPeerId) continue;
+        if (now - data.lastSeen > 10000) {
+          this.peerMap.delete(id);
+          changed = true;
+          this.currentSkipVotes.delete(data.peer.name);
+        }
+      }
+      if (changed) {
+        this.updateActivePeers();
+        // If current DJ went offline, and I am host or the oldest peer, claim DJ
+        if (
+          this.activeDjName &&
+          !this.activePeers.some((p) => p.name === this.activeDjName)
+        ) {
+          this.isDJ = true;
+          this.activeDjName = this.userName;
+          const me = this.peerMap.get(this.myPeerId);
+          if (me) me.peer.isDJ = true;
+          this.updateActivePeers();
+          this.onDjChanged?.(this.userName, true);
+        }
+      }
+    }, 3000);
+  }
+
+  private stopPruning() {
+    if (this.pruneTimer) {
+      clearInterval(this.pruneTimer);
+      this.pruneTimer = null;
+    }
+  }
+
+  // Process incoming payloads from room subscribers
+  private handleIncomingPayload(payload: SyncPayload) {
+    // Ignore our own broadcast messages
+    if (payload.senderId && payload.senderId === this.myPeerId) {
+      return;
+    }
+
+    switch (payload.type) {
+      case 'JOIN':
+      case 'HEARTBEAT': {
+        if (payload.peer && payload.peer.id) {
+          const isNew = !this.peerMap.has(payload.peer.id);
+          this.peerMap.set(payload.peer.id, {
+            peer: payload.peer,
+            lastSeen: Date.now(),
+          });
+          this.updateActivePeers();
+
+          if (payload.auxMode) this.auxMode = payload.auxMode;
+          if (payload.activeDjName) {
+            this.activeDjName = payload.activeDjName;
+            this.isDJ = this.auxMode === 'open-aux' || this.activeDjName === this.userName;
+          }
+
+          if (isNew && payload.type === 'JOIN') {
+            const joinMsg: RoomMessage = {
+              id: `msg-${Date.now()}-${Math.random()}`,
+              sender: 'AuxParty',
+              text: `${payload.peer.name} joined the room! 🎧`,
+              timestamp: Date.now(),
+              isSystem: true,
+            };
+            this.onChatReceived?.(joinMsg);
+
+            // If I am DJ or Host, reply with current state
+            if (this.isDJ || this.isHost) {
+              const st = this.stateGetter ? this.stateGetter() : null;
+              if (st) {
+                this.publish({
+                  type: 'SYNC_STATE',
+                  senderId: this.myPeerId,
+                  sender: this.userName,
+                  track: st.track,
+                  isPlaying: st.isPlaying,
+                  position: st.position,
+                  timestamp: Date.now(),
+                  queue: st.queue,
+                  activeDjName: this.activeDjName,
+                  auxMode: this.auxMode,
+                });
+              }
+            }
           }
         }
-      });
-    } else if (this.hostConnection && this.hostConnection.open) {
-      try {
-        this.hostConnection.send(payload);
-      } catch (e) {
-        console.error('Send to host error:', e);
+        break;
+      }
+
+      case 'LEAVE': {
+        if (payload.peerId) {
+          const existing = this.peerMap.get(payload.peerId);
+          this.peerMap.delete(payload.peerId);
+          this.updateActivePeers();
+          if (existing) {
+            this.currentSkipVotes.delete(existing.peer.name);
+            const leaveMsg: RoomMessage = {
+              id: `msg-${Date.now()}`,
+              sender: 'AuxParty',
+              text: `${existing.peer.name} left the room.`,
+              timestamp: Date.now(),
+              isSystem: true,
+            };
+            this.onChatReceived?.(leaveMsg);
+          }
+        }
+        break;
+      }
+
+      case 'REQUEST_STATE': {
+        if (this.isDJ || this.isHost) {
+          const st = this.stateGetter ? this.stateGetter() : null;
+          if (st) {
+            this.publish({
+              type: 'SYNC_STATE',
+              senderId: this.myPeerId,
+              sender: this.userName,
+              track: st.track,
+              isPlaying: st.isPlaying,
+              position: st.position,
+              timestamp: Date.now(),
+              queue: st.queue,
+              activeDjName: this.activeDjName,
+              auxMode: this.auxMode,
+            });
+          }
+        }
+        break;
+      }
+
+      case 'INIT_SYNC':
+      case 'SYNC_STATE': {
+        if (payload.activeDjName) {
+          this.activeDjName = payload.activeDjName;
+          this.isDJ = this.auxMode === 'open-aux' || this.activeDjName === this.userName;
+        }
+        if (payload.auxMode) {
+          this.auxMode = payload.auxMode;
+        }
+        this.onSyncReceived?.(payload);
+        break;
+      }
+
+      case 'QUEUE_UPDATE': {
+        this.onSyncReceived?.(payload);
+        break;
+      }
+
+      case 'CHAT': {
+        if (payload.message) {
+          this.onChatReceived?.(payload.message);
+        }
+        break;
+      }
+
+      case 'REACTION': {
+        if (payload.emoji) {
+          this.onReactionReceived?.(payload.emoji, payload.sender || 'Friend');
+        }
+        break;
+      }
+
+      case 'TRIGGER_SOUND': {
+        if (payload.sound) {
+          this.onSoundTriggered?.(payload.sound, payload.sender || 'Friend');
+        }
+        break;
+      }
+
+      case 'VOTE_SKIP': {
+        const voter = payload.sender || 'Friend';
+        this.currentSkipVotes.add(voter);
+        const votes = Array.from(this.currentSkipVotes);
+        this.onVoteSkipReceived?.(votes);
+        break;
+      }
+
+      case 'VOTE_TRACK': {
+        if (payload.trackId) {
+          this.onVoteTrackReceived?.(payload.trackId, payload.sender || 'Friend');
+        }
+        break;
+      }
+
+      case 'SET_AUX_MODE': {
+        if (payload.auxMode) {
+          this.auxMode = payload.auxMode;
+          this.isDJ = this.auxMode === 'open-aux' || this.activeDjName === this.userName;
+          this.onAuxModeChanged?.(payload.auxMode);
+        }
+        break;
+      }
+
+      case 'TRANSFER_AUX': {
+        if (payload.activeDjName) {
+          this.activeDjName = payload.activeDjName;
+          this.isDJ = this.auxMode === 'open-aux' || this.activeDjName === this.userName;
+          this.onDjChanged?.(payload.activeDjName, this.isDJ);
+        }
+        break;
+      }
+
+      case 'REQUEST_ADD_TO_QUEUE': {
+        if (payload.track) {
+          this.onQueueAddRequested?.(payload.track, payload.sender || 'Friend');
+        }
+        break;
+      }
+
+      case 'REQUEST_ADD_MANY_TO_QUEUE': {
+        if (payload.tracks) {
+          this.onQueueAddManyRequested?.(payload.tracks, payload.sender || 'Friend');
+        }
+        break;
       }
     }
   }
 
-  // Broadcast playback state
-  public broadcastPlayback(track: Track | null, isPlaying: boolean, position: number, queue: Track[]) {
-    if (!this.isHost && this.auxMode !== 'open-aux' && this.activeDjName !== this.userName) return;
-    this.broadcast({
+  // Broadcast playback state to room
+  public broadcastPlayback(
+    track: Track | null,
+    isPlaying: boolean,
+    position: number,
+    queue: Track[]
+  ) {
+    if (!this.isHost && this.auxMode !== 'open-aux' && this.activeDjName !== this.userName) {
+      return;
+    }
+    this.publish({
       type: 'SYNC_STATE',
+      senderId: this.myPeerId,
+      sender: this.userName,
       track,
       isPlaying,
       position,
       timestamp: Date.now(),
       queue,
+      activeDjName: this.activeDjName,
+      auxMode: this.auxMode,
     });
   }
 
-  // Sound effect
   public triggerSound(sound: SoundEffectType) {
-    if (this.isHost) {
-      this.broadcast({ type: 'TRIGGER_SOUND', sound, sender: this.userName });
-      this.onSoundTriggered?.(sound, this.userName);
-    } else {
-      this.broadcast({ type: 'TRIGGER_SOUND', sound, sender: this.userName });
-    }
+    this.publish({
+      type: 'TRIGGER_SOUND',
+      senderId: this.myPeerId,
+      sound,
+      sender: this.userName,
+    });
+    this.onSoundTriggered?.(sound, this.userName);
   }
 
-  // Vote to skip
   public voteSkip() {
-    if (this.isHost) {
-      this.currentSkipVotes.add(this.userName);
-      const votesArray = Array.from(this.currentSkipVotes);
-      this.broadcast({ type: 'VOTE_SKIP', skipVotes: votesArray });
-      this.onVoteSkipReceived?.(votesArray);
-    } else {
-      this.broadcast({ type: 'VOTE_SKIP', sender: this.userName });
-    }
+    this.currentSkipVotes.add(this.userName);
+    const votes = Array.from(this.currentSkipVotes);
+    this.publish({
+      type: 'VOTE_SKIP',
+      senderId: this.myPeerId,
+      sender: this.userName,
+    });
+    this.onVoteSkipReceived?.(votes);
   }
 
-  // Reset skip votes (e.g. when track changes)
   public resetSkipVotes() {
     this.currentSkipVotes.clear();
-    this.broadcast({ type: 'VOTE_SKIP', skipVotes: [] });
     this.onVoteSkipReceived?.([]);
   }
 
-  // Toggle Aux Mode (Host only)
   public setAuxMode(mode: AuxMode) {
-    if (!this.isHost) return;
     this.auxMode = mode;
-    this.broadcast({ type: 'SET_AUX_MODE', auxMode: mode });
+    this.isDJ = mode === 'open-aux' || this.activeDjName === this.userName;
+    this.publish({
+      type: 'SET_AUX_MODE',
+      senderId: this.myPeerId,
+      auxMode: mode,
+      sender: this.userName,
+    });
     this.onAuxModeChanged?.(mode);
   }
 
-  // Pass the Aux / Delegate DJ (Host only)
   public transferAux(targetPeerName: string) {
-    if (!this.isHost) return;
     this.activeDjName = targetPeerName;
-    this.broadcast({ type: 'TRANSFER_AUX', activeDjName: targetPeerName });
+    this.isDJ = this.auxMode === 'open-aux' || targetPeerName === this.userName;
+    this.publish({
+      type: 'TRANSFER_AUX',
+      senderId: this.myPeerId,
+      activeDjName: targetPeerName,
+      sender: this.userName,
+    });
     this.onDjChanged?.(targetPeerName, targetPeerName === this.userName);
   }
 
-  // Request to add a track to the shared room queue
   public requestAddToQueue(track: Track) {
-    const enrichedTrack = { ...track, addedBy: this.userName, votes: 0 };
-    if (this.isHost) return;
-    this.broadcast({
+    const enriched = { ...track, addedBy: this.userName, votes: 0 };
+    this.publish({
       type: 'REQUEST_ADD_TO_QUEUE',
-      track: enrichedTrack,
+      senderId: this.myPeerId,
+      track: enriched,
       sender: this.userName,
     });
   }
 
   public requestAddManyToQueue(tracks: Track[]) {
     const enriched = tracks.map((t) => ({ ...t, addedBy: this.userName, votes: 0 }));
-    if (this.isHost) return;
-    this.broadcast({
+    this.publish({
       type: 'REQUEST_ADD_MANY_TO_QUEUE',
+      senderId: this.myPeerId,
       tracks: enriched,
       sender: this.userName,
     });
@@ -578,51 +728,82 @@ export class RoomSyncService {
       text: text.trim(),
       timestamp: Date.now(),
     };
-    if (this.isHost) {
-      this.broadcast({ type: 'CHAT', message: msg });
-      this.onChatReceived?.(msg);
-    } else {
-      this.broadcast({ type: 'CHAT', message: msg });
-    }
+    this.publish({
+      type: 'CHAT',
+      senderId: this.myPeerId,
+      message: msg,
+      sender: this.userName,
+    });
+    this.onChatReceived?.(msg);
   }
 
   public sendReaction(emoji: string) {
-    if (this.isHost) {
-      this.broadcast({ type: 'REACTION', emoji, sender: this.userName });
-      this.onReactionReceived?.(emoji, this.userName);
-    } else {
-      this.broadcast({ type: 'REACTION', emoji, sender: this.userName });
-    }
+    this.publish({
+      type: 'REACTION',
+      senderId: this.myPeerId,
+      emoji,
+      sender: this.userName,
+    });
+    this.onReactionReceived?.(emoji, this.userName);
+  }
+
+  public broadcast(payload: SyncPayload) {
+    payload.senderId = this.myPeerId;
+    payload.sender = this.userName;
+    this.publish(payload);
+  }
+
+  public abortJoin() {
+    this.leave();
+  }
+
+  private sendLeaveBeacon() {
+    if (!this.roomCode || !this.myPeerId) return;
+    try {
+      const topic = `${TOPIC_PREFIX}${this.roomCode.toLowerCase()}`;
+      const payload: SyncPayload = {
+        type: 'LEAVE',
+        senderId: this.myPeerId,
+        peerId: this.myPeerId,
+        sender: this.userName,
+      };
+      if (typeof navigator !== 'undefined' && navigator.sendBeacon) {
+        navigator.sendBeacon(`${PUB_SERVER}/${topic}`, JSON.stringify(payload));
+      }
+    } catch {}
   }
 
   public leave() {
-    if (this.connectionTimeoutId) {
-      clearTimeout(this.connectionTimeoutId);
-      this.connectionTimeoutId = null;
+    this.sendLeaveBeacon();
+    this.stopHeartbeat();
+    this.stopPruning();
+
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
     }
-    this.connections.forEach((c) => {
+
+    if (this.ws) {
       try {
-        c.close();
+        this.ws.close();
       } catch {}
-    });
-    this.connections.clear();
-    if (this.hostConnection) {
-      try {
-        this.hostConnection.close();
-      } catch {}
-      this.hostConnection = null;
+      this.ws = null;
     }
-    if (this.peer) {
+
+    if (this.es) {
       try {
-        this.peer.destroy();
+        this.es.close();
       } catch {}
-      this.peer = null;
+      this.es = null;
     }
+
+    this.peerMap.clear();
     this.activePeers = [];
     this.isHost = false;
     this.isDJ = false;
     this.roomCode = '';
     this.currentSkipVotes.clear();
+    this.stateGetter = null;
   }
 }
 
