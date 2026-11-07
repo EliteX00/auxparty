@@ -20,6 +20,7 @@ interface RoomContextType {
   isConnecting: boolean;
   createRoom: (hostName: string, customCode?: string) => Promise<string | null>;
   joinRoom: (roomCode: string, guestName: string) => Promise<boolean>;
+  cancelConnecting: () => void;
   leaveRoom: () => void;
   sendMessage: (text: string) => void;
   sendReaction: (emoji: string) => void;
@@ -85,9 +86,17 @@ export const RoomProvider: React.FC<{ children: React.ReactNode }> = ({ children
           payload.timestamp || Date.now(),
           payload.queue
         );
-        if (payload.skipVotes) {
-          setRoomState((prev) => ({ ...prev, skipVotes: payload.skipVotes || [] }));
-        }
+        setRoomState((prev) => ({
+          ...prev,
+          hostName: payload.hostName || prev.hostName,
+          activeDjName: payload.activeDjName || prev.activeDjName,
+          auxMode: payload.auxMode || prev.auxMode,
+          peers: payload.peers && payload.peers.length > 0 ? payload.peers : prev.peers,
+          skipVotes: payload.skipVotes || prev.skipVotes,
+          isDJ:
+            payload.auxMode === 'open-aux' ||
+            (payload.activeDjName ? payload.activeDjName === prev.userName : prev.isDJ),
+        }));
       } else if (payload.type === 'QUEUE_UPDATE' && payload.queue) {
         player.syncFromHost(player.currentTrack, player.isPlaying, player.currentTime, Date.now(), payload.queue);
       }
@@ -238,66 +247,102 @@ export const RoomProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setIsConnecting(true);
     setError(null);
     const code = (customCode || RoomSyncService.generateRoomCode(4)).toUpperCase();
-    const success = await roomSync.createRoom(code, hostName, {
-      track: player.currentTrack,
-      isPlaying: player.isPlaying,
-      position: player.currentTime,
-      queue: player.queue,
-    });
+    const cleanHostName = hostName.trim() || 'DJ (Host)';
 
-    setIsConnecting(false);
-    if (success) {
-      setRoomState({
-        roomId: `auxparty-${code.toLowerCase()}`,
-        roomCode: code,
-        isHost: true,
-        isDJ: true,
-        hostName: hostName || 'DJ (Host)',
-        activeDjName: hostName || 'DJ (Host)',
-        userName: hostName || 'DJ (Host)',
-        connected: true,
-        peers: [{ id: 'host', name: hostName || 'DJ (Host)', isHost: true, isDJ: true, color: '#8b5cf6' }],
-        auxMode: 'host-only',
-        skipVotes: [],
-      });
-      setMessages([
-        {
-          id: 'welcome',
-          sender: 'AuxParty',
-          text: `Room created! Share link: /room/${code.toLowerCase()}`,
-          timestamp: Date.now(),
-          isSystem: true,
-        },
-      ]);
-      return code;
+    try {
+      const success = await roomSync.createRoom(code, cleanHostName, () => ({
+        track: player.currentTrack,
+        isPlaying: player.isPlaying,
+        position: player.currentTime,
+        queue: player.queue,
+      }));
+
+      setIsConnecting(false);
+      if (success) {
+        setRoomState({
+          roomId: `auxparty-${code.toLowerCase()}`,
+          roomCode: code,
+          isHost: true,
+          isDJ: true,
+          hostName: cleanHostName,
+          activeDjName: cleanHostName,
+          userName: cleanHostName,
+          connected: true,
+          peers: [{ id: 'host', name: cleanHostName, isHost: true, isDJ: true, color: '#8b5cf6' }],
+          auxMode: 'host-only',
+          skipVotes: [],
+        });
+        if (typeof window !== 'undefined') {
+          sessionStorage.setItem(
+            'auxparty_session',
+            JSON.stringify({ role: 'host', roomCode: code, userName: cleanHostName })
+          );
+          localStorage.setItem('auxparty_nickname', cleanHostName);
+        }
+        setMessages([
+          {
+            id: 'welcome',
+            sender: 'AuxParty',
+            text: `Room created! Share link: /room/${code.toLowerCase()}`,
+            timestamp: Date.now(),
+            isSystem: true,
+          },
+        ]);
+        return code;
+      }
+      return null;
+    } catch (e: any) {
+      setIsConnecting(false);
+      setError(e.message || 'Failed to create room');
+      return null;
     }
-    return null;
   };
 
   const joinRoom = async (roomCode: string, guestName: string): Promise<boolean> => {
     setIsConnecting(true);
     setError(null);
     const cleanCode = roomCode.trim().toUpperCase();
-    const success = await roomSync.joinRoom(cleanCode, guestName);
+    const cleanName = guestName.trim() || 'Friend';
 
-    setIsConnecting(false);
-    if (success) {
-      setRoomState({
-        roomId: `auxparty-${cleanCode.toLowerCase()}`,
-        roomCode: cleanCode,
-        isHost: false,
-        isDJ: false,
-        hostName: 'Host',
-        activeDjName: 'DJ',
-        userName: guestName || 'Friend',
-        connected: true,
-        peers: [],
-        auxMode: 'host-only',
-        skipVotes: [],
-      });
-      return true;
+    try {
+      const success = await roomSync.joinRoom(cleanCode, cleanName);
+
+      setIsConnecting(false);
+      if (success) {
+        setRoomState({
+          roomId: `auxparty-${cleanCode.toLowerCase()}`,
+          roomCode: cleanCode,
+          isHost: false,
+          isDJ: false,
+          hostName: 'Host',
+          activeDjName: 'DJ',
+          userName: cleanName,
+          connected: true,
+          peers: [],
+          auxMode: 'host-only',
+          skipVotes: [],
+        });
+        if (typeof window !== 'undefined') {
+          sessionStorage.setItem(
+            'auxparty_session',
+            JSON.stringify({ role: 'guest', roomCode: cleanCode, userName: cleanName })
+          );
+          localStorage.setItem('auxparty_nickname', cleanName);
+        }
+        return true;
+      }
+      return false;
+    } catch (e: any) {
+      setIsConnecting(false);
+      setError(e.message || 'Failed to join room');
+      return false;
     }
-    return false;
+  };
+
+  const cancelConnecting = () => {
+    roomSync.abortJoin();
+    setIsConnecting(false);
+    setError(null);
   };
 
   const leaveRoom = () => {
@@ -305,6 +350,9 @@ export const RoomProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setRoomState(initialRoomState);
     setMessages([]);
     setReactions([]);
+    if (typeof window !== 'undefined') {
+      sessionStorage.removeItem('auxparty_session');
+    }
   };
 
   const sendMessage = (text: string) => {
@@ -339,17 +387,39 @@ export const RoomProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const transferAux = (targetPeerName: string) => {
     roomSync.transferAux(targetPeerName);
-    setRoomState((prev) => ({
-      ...prev,
-      activeDjName: targetPeerName,
-      isDJ: targetPeerName === prev.userName,
-    }));
+  };
+
+  // Upvote / Vote track in room queue
+  const upvoteTrack = (trackId: string) => {
+    if (roomState.isHost) {
+      const updatedQueue = player.queue.map((t) => {
+        if (t.id === trackId) {
+          const currentVotes = (t.votes || 0) + 1;
+          return { ...t, votes: currentVotes };
+        }
+        return t;
+      });
+      updatedQueue.sort((a, b) => (b.votes || 0) - (a.votes || 0));
+      player.syncFromHost(player.currentTrack, player.isPlaying, player.currentTime, Date.now(), updatedQueue);
+      roomSync.broadcast({ type: 'QUEUE_UPDATE', queue: updatedQueue });
+    } else {
+      roomSync.broadcast({ type: 'VOTE_TRACK', trackId, sender: roomState.userName });
+    }
   };
 
   const addToRoomQueue = (track: Track) => {
     const enriched = { ...track, addedBy: roomState.userName, votes: 0 };
     if (roomState.isHost) {
       player.addToQueue(enriched);
+      const msg: RoomMessage = {
+        id: `msg-${Date.now()}-${Math.random()}`,
+        sender: 'AuxParty',
+        text: `${roomState.userName} queued "${track.title}" 🎵`,
+        timestamp: Date.now(),
+        isSystem: true,
+      };
+      setMessages((prev) => [...prev, msg]);
+      roomSync.broadcast({ type: 'CHAT', message: msg });
     } else {
       roomSync.requestAddToQueue(enriched);
     }
@@ -359,27 +429,17 @@ export const RoomProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const enriched = tracks.map((t) => ({ ...t, addedBy: roomState.userName, votes: 0 }));
     if (roomState.isHost) {
       enriched.forEach((t) => player.addToQueue(t));
+      const msg: RoomMessage = {
+        id: `msg-${Date.now()}-${Math.random()}`,
+        sender: 'AuxParty',
+        text: `${roomState.userName} queued ${tracks.length} tracks from Spotify! 🟢`,
+        timestamp: Date.now(),
+        isSystem: true,
+      };
+      setMessages((prev) => [...prev, msg]);
+      roomSync.broadcast({ type: 'CHAT', message: msg });
     } else {
       roomSync.requestAddManyToQueue(enriched);
-    }
-  };
-
-  const upvoteTrack = (trackId: string) => {
-    // Increment vote count and sort queue
-    if (roomState.isHost) {
-      const updatedQueue = player.queue.map((t) => {
-        if (t.id === trackId) {
-          const currentVotes = (t.votes || 0) + 1;
-          return { ...t, votes: currentVotes };
-        }
-        return t;
-      });
-      // Sort by votes descending
-      updatedQueue.sort((a, b) => (b.votes || 0) - (a.votes || 0));
-      player.syncFromHost(player.currentTrack, player.isPlaying, player.currentTime, Date.now(), updatedQueue);
-      roomSync.broadcast({ type: 'QUEUE_UPDATE', queue: updatedQueue });
-    } else {
-      roomSync.broadcast({ type: 'VOTE_TRACK', trackId, sender: roomState.userName });
     }
   };
 
@@ -395,6 +455,7 @@ export const RoomProvider: React.FC<{ children: React.ReactNode }> = ({ children
         isConnecting,
         createRoom,
         joinRoom,
+        cancelConnecting,
         leaveRoom,
         sendMessage,
         sendReaction,

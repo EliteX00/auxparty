@@ -36,6 +36,7 @@ export const RoomModal: React.FC<RoomModalProps> = ({ isOpen, onClose }) => {
     isConnecting,
     createRoom,
     joinRoom,
+    cancelConnecting,
     leaveRoom,
     sendMessage,
     sendReaction,
@@ -43,8 +44,14 @@ export const RoomModal: React.FC<RoomModalProps> = ({ isOpen, onClose }) => {
   } = useRoom();
 
   const [activeTab, setActiveTab] = useState<'create' | 'join'>('create');
-  const [hostNameInput, setHostNameInput] = useState('');
-  const [guestNameInput, setGuestNameInput] = useState('');
+  const [hostNameInput, setHostNameInput] = useState(() => {
+    if (typeof window !== 'undefined') return localStorage.getItem('auxparty_nickname') || '';
+    return '';
+  });
+  const [guestNameInput, setGuestNameInput] = useState(() => {
+    if (typeof window !== 'undefined') return localStorage.getItem('auxparty_nickname') || '';
+    return '';
+  });
   const [roomCodeInput, setRoomCodeInput] = useState('');
   const [customRoomCode, setCustomRoomCode] = useState('');
   const [chatInput, setChatInput] = useState('');
@@ -366,6 +373,16 @@ export const RoomModal: React.FC<RoomModalProps> = ({ isOpen, onClose }) => {
                     </>
                   )}
                 </button>
+
+                {isConnecting && (
+                  <button
+                    type="button"
+                    onClick={cancelConnecting}
+                    className="w-full py-1 text-xs text-zinc-400 hover:text-white transition-colors"
+                  >
+                    Cancel
+                  </button>
+                )}
               </form>
             )}
 
@@ -416,6 +433,16 @@ export const RoomModal: React.FC<RoomModalProps> = ({ isOpen, onClose }) => {
                     </>
                   )}
                 </button>
+
+                {isConnecting && (
+                  <button
+                    type="button"
+                    onClick={cancelConnecting}
+                    className="w-full py-1 text-xs text-zinc-400 hover:text-white transition-colors"
+                  >
+                    Cancel
+                  </button>
+                )}
               </form>
             )}
           </div>

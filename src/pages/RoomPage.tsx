@@ -58,6 +58,7 @@ export const RoomPage: React.FC = () => {
     isConnecting,
     joinRoom,
     createRoom,
+    cancelConnecting,
     leaveRoom,
     sendMessage,
     sendReaction,
@@ -94,8 +95,25 @@ export const RoomPage: React.FC = () => {
 
   // Local State
   const [palette, setPalette] = useState<TrackPalette>(DEFAULT_PALETTE);
-  const [userNameInput, setUserNameInput] = useState('');
+  const [userNameInput, setUserNameInput] = useState(() => {
+    if (typeof window !== 'undefined') {
+      return localStorage.getItem('auxparty_nickname') || '';
+    }
+    return '';
+  });
   const [copied, setCopied] = useState(false);
+
+  const isPreviousHostOfThisRoom = useMemo(() => {
+    if (typeof window === 'undefined') return false;
+    try {
+      const saved = sessionStorage.getItem('auxparty_session');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        return parsed.role === 'host' && parsed.roomCode === targetCode;
+      }
+    } catch {}
+    return false;
+  }, [targetCode]);
   const [activeTab, setActiveTab] = useState<'queue' | 'chat'>('queue');
   const [chatInput, setChatInput] = useState('');
   const [isSpotifyModalOpen, setIsSpotifyModalOpen] = useState(false);
@@ -224,10 +242,41 @@ export const RoomPage: React.FC = () => {
             </div>
           </div>
 
+          {isPreviousHostOfThisRoom && (
+            <div className="p-3.5 rounded-2xl bg-purple-500/15 border border-purple-500/30 text-purple-200 text-xs flex items-center justify-between gap-3 shadow-lg shadow-purple-900/20">
+              <div>
+                <p className="font-bold text-white flex items-center gap-1.5">
+                  <Crown className="w-3.5 h-3.5 text-purple-300" />
+                  You were hosting this room
+                </p>
+                <p className="text-[11px] text-purple-300/80 mt-0.5">Resume your DJ session with 1-click.</p>
+              </div>
+              <button
+                type="button"
+                onClick={handleCreateThisRoom}
+                className="px-3 py-2 rounded-xl bg-purple-600 hover:bg-purple-500 text-white font-bold text-xs transition-all shrink-0 shadow-lg shadow-purple-600/30 hover:scale-[1.02] active:scale-95"
+              >
+                Resume as Host
+              </button>
+            </div>
+          )}
+
           {error && (
-            <div className="flex items-center gap-2 p-3.5 rounded-xl bg-red-950/40 border border-red-500/30 text-red-300 text-xs">
-              <AlertCircle className="w-4 h-4 shrink-0" />
-              <span>{error}</span>
+            <div className="p-4 rounded-2xl bg-red-950/50 border border-red-500/30 text-red-200 text-xs space-y-2.5 shadow-lg shadow-red-950/20">
+              <div className="flex items-start gap-2.5">
+                <AlertCircle className="w-4 h-4 shrink-0 text-red-400 mt-0.5" />
+                <span className="leading-relaxed font-medium">{error}</span>
+              </div>
+              <div className="pt-2 border-t border-red-500/20 flex items-center justify-between gap-2">
+                <span className="text-[11px] text-zinc-300">Host not active? Start it yourself:</span>
+                <button
+                  type="button"
+                  onClick={handleCreateThisRoom}
+                  className="px-3 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white font-bold text-xs transition-colors shrink-0 shadow-md"
+                >
+                  Host Room #{targetCode}
+                </button>
+              </div>
             </div>
           )}
 
@@ -239,7 +288,12 @@ export const RoomPage: React.FC = () => {
               <input
                 type="text"
                 value={userNameInput}
-                onChange={(e) => setUserNameInput(e.target.value)}
+                onChange={(e) => {
+                  setUserNameInput(e.target.value);
+                  if (typeof window !== 'undefined') {
+                    localStorage.setItem('auxparty_nickname', e.target.value);
+                  }
+                }}
                 placeholder="e.g. Alex"
                 autoFocus
                 className="w-full glass-input rounded-xl px-4 py-3 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none transition-all font-medium"
@@ -263,14 +317,24 @@ export const RoomPage: React.FC = () => {
                 </>
               )}
             </button>
+
+            {isConnecting && (
+              <button
+                type="button"
+                onClick={cancelConnecting}
+                className="w-full py-1.5 text-xs font-medium text-zinc-400 hover:text-white transition-colors"
+              >
+                Cancel connecting
+              </button>
+            )}
           </form>
 
-          <div className="pt-2 text-center">
-            <span className="text-xs text-zinc-500 block mb-2">Want to start this room as Host / DJ?</span>
+          <div className="pt-2 text-center border-t border-white/5">
+            <span className="text-xs text-zinc-400 block mb-2 font-medium">Want to start this room as Host / DJ?</span>
             <button
+              type="button"
               onClick={handleCreateThisRoom}
-              disabled={isConnecting}
-              className="text-xs font-bold text-purple-400 hover:text-purple-300 underline underline-offset-4"
+              className="text-xs font-bold text-purple-400 hover:text-purple-300 underline underline-offset-4 transition-colors"
             >
               Start Room #{targetCode} as DJ (Host)
             </button>

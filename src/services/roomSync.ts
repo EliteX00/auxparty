@@ -1,4 +1,4 @@
-import { Peer, DataConnection } from 'peerjs';
+import { Peer, DataConnection, PeerOptions } from 'peerjs';
 import { Track, RoomPeer, RoomMessage, AuxMode, SoundEffectType } from '../types';
 
 export type SyncEventType =
@@ -42,6 +42,36 @@ export interface SyncPayload {
   trackId?: string;
 }
 
+export type StateGetter = () => {
+  track: Track | null;
+  isPlaying: boolean;
+  position: number;
+  queue: Track[];
+};
+
+export const DEFAULT_PEER_OPTIONS: PeerOptions = {
+  debug: 1,
+  config: {
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun2.l.google.com:19302' },
+      { urls: 'stun:stun3.l.google.com:19302' },
+      { urls: 'stun:stun4.l.google.com:19302' },
+      { urls: 'stun:stun.cloudflare.com:3478' },
+      {
+        urls: [
+          'turn:relay.metered.ca:80',
+          'turn:relay.metered.ca:80?transport=tcp',
+        ],
+        username: 'openrelayproject',
+        credential: 'openrelayproject',
+      },
+    ],
+    iceCandidatePoolSize: 10,
+  },
+};
+
 export class RoomSyncService {
   private peer: Peer | null = null;
   private connections: Map<string, DataConnection> = new Map();
@@ -68,6 +98,15 @@ export class RoomSyncService {
 
   private activePeers: RoomPeer[] = [];
   public currentSkipVotes: Set<string> = new Set();
+  private connectionTimeoutId: ReturnType<typeof setTimeout> | null = null;
+
+  constructor() {
+    if (typeof window !== 'undefined') {
+      window.addEventListener('beforeunload', () => {
+        this.leave();
+      });
+    }
+  }
 
   public static generateRoomCode(len: number = 4): string {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -82,9 +121,13 @@ export class RoomSyncService {
   public async createRoom(
     roomCode: string,
     hostName: string,
-    initialState: { track: Track | null; isPlaying: boolean; position: number; queue: Track[] }
+    initialState:
+      | { track: Track | null; isPlaying: boolean; position: number; queue: Track[] }
+      | StateGetter
   ): Promise<boolean> {
-    this.roomCode = roomCode.toUpperCase();
+    this.leave();
+
+    this.roomCode = roomCode.toUpperCase().trim();
     this.userName = hostName || 'DJ (Host)';
     this.isHost = true;
     this.isDJ = true;
@@ -106,30 +149,60 @@ export class RoomSyncService {
     const peerId = `auxparty-${this.roomCode.toLowerCase()}`;
 
     return new Promise((resolve) => {
-      try {
-        this.peer = new Peer(peerId);
+      let resolved = false;
 
-        this.peer.on('open', () => {
+      const finish = (success: boolean, errorMsg?: string) => {
+        if (resolved) return;
+        resolved = true;
+        if (this.connectionTimeoutId) {
+          clearTimeout(this.connectionTimeoutId);
+          this.connectionTimeoutId = null;
+        }
+        if (!success) {
+          if (errorMsg) this.onError?.(errorMsg);
+          this.leave();
+        }
+        resolve(success);
+      };
+
+      this.connectionTimeoutId = setTimeout(() => {
+        finish(
+          false,
+          `Timed out starting room #${this.roomCode}. Signaling server may be busy, please try again.`
+        );
+      }, 10000);
+
+      try {
+        const peer = new Peer(peerId, DEFAULT_PEER_OPTIONS);
+        this.peer = peer;
+
+        peer.on('open', () => {
           this.onPeersUpdated?.(this.activePeers);
-          resolve(true);
+          finish(true);
         });
 
-        this.peer.on('error', (err: any) => {
+        peer.on('error', (err: any) => {
           console.error('Peer host error:', err);
           if (err.type === 'unavailable-id') {
-            this.onError?.('Room code already in use. Try a different code.');
+            finish(
+              false,
+              `Room #${this.roomCode} is already active or was recently hosted. Please wait a moment or try another code.`
+            );
+          } else if (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error') {
+            finish(
+              false,
+              'Unable to reach peer signaling server. If you are using Brave or an adblocker, allow WebSockets for this site.'
+            );
           } else {
-            this.onError?.(err.message || 'Connection error occurred');
+            finish(false, err.message || 'Connection error occurred while starting the room.');
           }
-          resolve(false);
         });
 
-        this.peer.on('connection', (conn) => {
+        peer.on('connection', (conn) => {
           this.handleIncomingConnection(conn, initialState);
         });
       } catch (e: any) {
-        this.onError?.(e.message || 'Failed to initialize room');
-        resolve(false);
+        finish(false, e.message || 'Failed to initialize room');
       }
     });
   }
@@ -137,7 +210,9 @@ export class RoomSyncService {
   // Handle a guest connecting to the host
   private handleIncomingConnection(
     conn: DataConnection,
-    getCurrentState: { track: Track | null; isPlaying: boolean; position: number; queue: Track[] }
+    initialState:
+      | { track: Track | null; isPlaying: boolean; position: number; queue: Track[] }
+      | StateGetter
   ) {
     conn.on('open', () => {
       this.connections.set(conn.peer, conn);
@@ -164,13 +239,14 @@ export class RoomSyncService {
           });
           this.onPeersUpdated?.(this.activePeers);
 
+          const currentState = typeof initialState === 'function' ? initialState() : initialState;
           conn.send({
             type: 'INIT_SYNC',
-            track: getCurrentState.track,
-            isPlaying: getCurrentState.isPlaying,
-            position: getCurrentState.position,
+            track: currentState.track,
+            isPlaying: currentState.isPlaying,
+            position: currentState.position,
             timestamp: Date.now(),
-            queue: getCurrentState.queue,
+            queue: currentState.queue,
             hostName: this.userName,
             activeDjName: this.activeDjName,
             peers: this.activePeers,
@@ -241,7 +317,9 @@ export class RoomSyncService {
 
   // Join room as Guest
   public async joinRoom(roomCode: string, guestName: string): Promise<boolean> {
-    this.roomCode = roomCode.toUpperCase();
+    this.leave();
+
+    this.roomCode = roomCode.toUpperCase().trim();
     this.userName = guestName || 'Friend';
     this.isHost = false;
     this.isDJ = false;
@@ -250,74 +328,147 @@ export class RoomSyncService {
     const hostPeerId = `auxparty-${this.roomCode.toLowerCase()}`;
 
     return new Promise((resolve) => {
+      let resolved = false;
+
+      const finish = (success: boolean, errorMsg?: string) => {
+        if (resolved) return;
+        resolved = true;
+        if (this.connectionTimeoutId) {
+          clearTimeout(this.connectionTimeoutId);
+          this.connectionTimeoutId = null;
+        }
+        if (!success) {
+          if (errorMsg) this.onError?.(errorMsg);
+          this.leave();
+        }
+        resolve(success);
+      };
+
+      // 10-second timeout: never leave the user hanging
+      this.connectionTimeoutId = setTimeout(() => {
+        finish(
+          false,
+          `Connection timed out. Room #${this.roomCode} may be offline or no host is currently active.`
+        );
+      }, 10000);
+
       try {
-        this.peer = new Peer();
+        const peer = new Peer(DEFAULT_PEER_OPTIONS);
+        this.peer = peer;
 
-        this.peer.on('open', () => {
-          if (!this.peer) return;
-          const conn = this.peer.connect(hostPeerId, { reliable: true });
-          this.hostConnection = conn;
+        peer.on('open', () => {
+          if (resolved || this.peer !== peer) return;
 
-          conn.on('open', () => {
-            conn.send({
-              type: 'JOIN',
-              sender: this.userName,
-            } as SyncPayload);
-            resolve(true);
-          });
+          try {
+            const conn = peer.connect(hostPeerId, { reliable: true });
+            this.hostConnection = conn;
 
-          conn.on('data', (raw: any) => {
-            const data = raw as SyncPayload;
-            if (data.type === 'PEER_LIST' && data.peers) {
-              this.activePeers = data.peers;
-              if (data.auxMode) this.auxMode = data.auxMode;
-              if (data.activeDjName) {
+            // Monitor WebRTC connection states
+            if (conn.peerConnection) {
+              const pc = conn.peerConnection;
+              pc.oniceconnectionstatechange = () => {
+                if (pc.iceConnectionState === 'failed') {
+                  finish(
+                    false,
+                    `Direct P2P connection failed to reach Room #${this.roomCode}. Network or firewall may be restricting WebRTC.`
+                  );
+                }
+              };
+              pc.onconnectionstatechange = () => {
+                if (pc.connectionState === 'failed') {
+                  finish(false, `WebRTC connection failed. Host may have gone offline.`);
+                }
+              };
+            }
+
+            conn.on('open', () => {
+              if (resolved) return;
+              try {
+                conn.send({
+                  type: 'JOIN',
+                  sender: this.userName,
+                } as SyncPayload);
+              } catch (e) {
+                console.error('Error sending JOIN payload:', e);
+              }
+              finish(true);
+            });
+
+            conn.on('data', (raw: any) => {
+              const data = raw as SyncPayload;
+              if (data.type === 'PEER_LIST' && data.peers) {
+                this.activePeers = data.peers;
+                if (data.auxMode) this.auxMode = data.auxMode;
+                if (data.activeDjName) {
+                  this.activeDjName = data.activeDjName;
+                  this.isDJ = this.auxMode === 'open-aux' || this.activeDjName === this.userName;
+                }
+                this.onPeersUpdated?.(data.peers);
+              } else if (data.type === 'CHAT' && data.message) {
+                this.onChatReceived?.(data.message);
+              } else if (data.type === 'REACTION' && data.emoji) {
+                this.onReactionReceived?.(data.emoji, data.sender || 'Friend');
+              } else if (data.type === 'TRIGGER_SOUND' && data.sound) {
+                this.onSoundTriggered?.(data.sound, data.sender || 'Friend');
+              } else if (data.type === 'VOTE_SKIP' && data.skipVotes) {
+                this.onVoteSkipReceived?.(data.skipVotes);
+              } else if (data.type === 'SET_AUX_MODE' && data.auxMode) {
+                this.auxMode = data.auxMode;
+                this.isDJ = this.auxMode === 'open-aux' || this.activeDjName === this.userName;
+                this.onAuxModeChanged?.(data.auxMode);
+              } else if (data.type === 'TRANSFER_AUX' && data.activeDjName) {
                 this.activeDjName = data.activeDjName;
                 this.isDJ = this.auxMode === 'open-aux' || this.activeDjName === this.userName;
+                this.onDjChanged?.(data.activeDjName, this.isDJ);
+              } else {
+                this.onSyncReceived?.(data);
               }
-              this.onPeersUpdated?.(data.peers);
-            } else if (data.type === 'CHAT' && data.message) {
-              this.onChatReceived?.(data.message);
-            } else if (data.type === 'REACTION' && data.emoji) {
-              this.onReactionReceived?.(data.emoji, data.sender || 'Friend');
-            } else if (data.type === 'TRIGGER_SOUND' && data.sound) {
-              this.onSoundTriggered?.(data.sound, data.sender || 'Friend');
-            } else if (data.type === 'VOTE_SKIP' && data.skipVotes) {
-              this.onVoteSkipReceived?.(data.skipVotes);
-            } else if (data.type === 'SET_AUX_MODE' && data.auxMode) {
-              this.auxMode = data.auxMode;
-              this.isDJ = this.auxMode === 'open-aux' || this.activeDjName === this.userName;
-              this.onAuxModeChanged?.(data.auxMode);
-            } else if (data.type === 'TRANSFER_AUX' && data.activeDjName) {
-              this.activeDjName = data.activeDjName;
-              this.isDJ = this.auxMode === 'open-aux' || this.activeDjName === this.userName;
-              this.onDjChanged?.(data.activeDjName, this.isDJ);
-            } else {
-              this.onSyncReceived?.(data);
-            }
-          });
+            });
 
-          conn.on('close', () => {
-            this.onError?.('Disconnected from room host.');
-          });
+            conn.on('close', () => {
+              this.onError?.('Disconnected from room host.');
+              this.leave();
+            });
 
-          conn.on('error', (err) => {
-            console.error('Guest connection error:', err);
-            this.onError?.('Could not find room. Check that the room code is active.');
-            resolve(false);
-          });
+            conn.on('error', (err: any) => {
+              console.error('Guest connection error:', err);
+              finish(false, `Could not find room #${this.roomCode}. Check that the room code is active.`);
+            });
+          } catch (e: any) {
+            console.error('Error connecting to host peer:', e);
+            finish(false, e.message || 'Failed to initiate connection with host.');
+          }
         });
 
-        this.peer.on('error', (err) => {
+        peer.on('error', (err: any) => {
           console.error('Peer guest error:', err);
-          this.onError?.('Unable to connect to room. Host may be offline.');
-          resolve(false);
+          if (err.type === 'peer-unavailable') {
+            finish(
+              false,
+              `Room #${this.roomCode} was not found or the host is offline. You can start this room as Host / DJ.`
+            );
+          } else if (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error') {
+            finish(
+              false,
+              'Signaling connection error. If you are using Brave or an adblocker, allow WebSockets/WebRTC, or check your internet connection.'
+            );
+          } else {
+            finish(false, err.message || 'Unable to connect to room. Host may be offline.');
+          }
         });
       } catch (err: any) {
-        this.onError?.(err.message || 'Failed to join room');
-        resolve(false);
+        finish(false, err.message || 'Failed to join room');
       }
     });
+  }
+
+  // Cancel any in-progress connection attempt
+  public abortJoin() {
+    if (this.connectionTimeoutId) {
+      clearTimeout(this.connectionTimeoutId);
+      this.connectionTimeoutId = null;
+    }
+    this.leave();
   }
 
   // Broadcast to all peers (or host if guest)
@@ -445,14 +596,26 @@ export class RoomSyncService {
   }
 
   public leave() {
-    this.connections.forEach((c) => c.close());
+    if (this.connectionTimeoutId) {
+      clearTimeout(this.connectionTimeoutId);
+      this.connectionTimeoutId = null;
+    }
+    this.connections.forEach((c) => {
+      try {
+        c.close();
+      } catch {}
+    });
     this.connections.clear();
     if (this.hostConnection) {
-      this.hostConnection.close();
+      try {
+        this.hostConnection.close();
+      } catch {}
       this.hostConnection = null;
     }
     if (this.peer) {
-      this.peer.destroy();
+      try {
+        this.peer.destroy();
+      } catch {}
       this.peer = null;
     }
     this.activePeers = [];
