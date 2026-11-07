@@ -28,26 +28,51 @@ export const AudioVisualizer: React.FC<VisualizerProps> = ({
     const bufferLength = analyserNode ? analyserNode.frequencyBinCount : 32;
     const dataArray = new Uint8Array(bufferLength);
 
-    const render = () => {
+    // Create gradient once per canvas dimensions (never allocate in the loop!)
+    const gradient = ctx.createLinearGradient(0, canvas.height, 0, 0);
+    gradient.addColorStop(0, '#7c3aed');
+    gradient.addColorStop(0.5, '#a855f7');
+    gradient.addColorStop(1, '#ec4899');
+
+    const drawIdle = () => {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const numBars = Math.floor(canvas.width / (barWidth + gap));
+      ctx.fillStyle = 'rgba(168, 85, 247, 0.25)';
+      for (let i = 0; i < numBars; i++) {
+        const x = i * (barWidth + gap);
+        const bHeight = 3;
+        const y = canvas.height - bHeight;
+        ctx.fillRect(x, y, barWidth, bHeight);
+      }
+    };
+
+    // When paused, draw idle once and DO NOT run requestAnimationFrame loop!
+    if (!isPlaying) {
+      drawIdle();
+      return;
+    }
+
+    let lastFrameTime = 0;
+    const render = (time: number) => {
       animationFrameRef.current = requestAnimationFrame(render);
 
-      if (analyserNode && isPlaying) {
+      // Throttle canvas draw calls to ~35-40 fps to leave GPU free for UI
+      if (time - lastFrameTime < 24) return;
+      lastFrameTime = time;
+
+      if (analyserNode) {
         analyserNode.getByteFrequencyData(dataArray);
       } else {
-        // Fallback idle wave or zeroes
+        const now = Date.now() / 200;
         for (let i = 0; i < dataArray.length; i++) {
-          if (isPlaying) {
-            dataArray[i] = Math.sin(Date.now() / 200 + i) * 20 + 30;
-          } else {
-            dataArray[i] = 4;
-          }
+          dataArray[i] = Math.sin(now + i) * 20 + 30;
         }
       }
 
       ctx.clearRect(0, 0, canvas.width, canvas.height);
-
       const numBars = Math.floor(canvas.width / (barWidth + gap));
       const step = Math.max(1, Math.floor(dataArray.length / numBars));
+      ctx.fillStyle = gradient;
 
       for (let i = 0; i < numBars; i++) {
         const val = dataArray[i * step] || 0;
@@ -56,20 +81,11 @@ export const AudioVisualizer: React.FC<VisualizerProps> = ({
         const x = i * (barWidth + gap);
         const y = canvas.height - bHeight;
 
-        // Gradient color for bars
-        const gradient = ctx.createLinearGradient(0, canvas.height, 0, 0);
-        gradient.addColorStop(0, '#7c3aed'); // purple
-        gradient.addColorStop(0.5, '#a855f7'); // lighter purple
-        gradient.addColorStop(1, '#ec4899'); // pink accent
-
-        ctx.fillStyle = gradient;
-        ctx.beginPath();
-        ctx.roundRect(x, y, barWidth, bHeight, [2, 2, 0, 0]);
-        ctx.fill();
+        ctx.fillRect(x, y, barWidth, bHeight);
       }
     };
 
-    render();
+    animationFrameRef.current = requestAnimationFrame(render);
 
     return () => {
       if (animationFrameRef.current) {

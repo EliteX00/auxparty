@@ -29,6 +29,18 @@ function cleanHtml(str: string): string {
     .replace(/&gt;/g, '>');
 }
 
+function extractYouTubeId(urlOrId: string): string | null {
+  if (!urlOrId) return null;
+  const str = urlOrId.trim();
+  if (/^[a-zA-Z0-9_-]{11}$/.test(str)) {
+    return str;
+  }
+  const match = str.match(
+    /(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/|youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})/
+  );
+  return match ? match[1] : null;
+}
+
 export default defineConfig({
   plugins: [
     react(),
@@ -49,12 +61,39 @@ export default defineConfig({
             }
 
             try {
+              // Check if query is a direct YouTube link
+              const ytId = extractYouTubeId(query);
+              let ytTrack: any = null;
+              if (ytId) {
+                try {
+                  const oembedUrl = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${ytId}&format=json`;
+                  const oembedRes = await fetch(oembedUrl);
+                  if (oembedRes.ok) {
+                    const oembedData = await oembedRes.json();
+                    ytTrack = {
+                      id: `yt-${ytId}`,
+                      youtubeId: ytId,
+                      source: 'youtube',
+                      title: cleanHtml(oembedData.title || `YouTube Video (${ytId})`),
+                      artist: cleanHtml(oembedData.author_name || 'YouTube Creator'),
+                      album: 'YouTube',
+                      duration: 0,
+                      image: `https://i.ytimg.com/vi/${ytId}/hqdefault.jpg`,
+                      streamUrl: `https://www.youtube.com/watch?v=${ytId}`,
+                      has320: false,
+                    };
+                  }
+                } catch (e) {
+                  console.error('YouTube search parse error:', e);
+                }
+              }
+
               const saavnUrl = `https://www.jiosaavn.com/api.php?__call=search.getResults&_format=json&_marker=0&cc=in&n=30&p=1&q=${encodeURIComponent(query)}`;
               const saavnRes = await fetch(saavnUrl, {
                 headers: { 'User-Agent': 'Mozilla/5.0' },
               });
               const data = await saavnRes.json();
-              const results = (data.results || []).map((item: any) => {
+              const saavnResults = (data.results || []).map((item: any) => {
                 const streamUrl = decryptMediaUrl(item.encrypted_media_url);
                 const rawImg = item.image || '';
                 const highResImg = rawImg.replace('150x150', '500x500').replace('50x50', '500x500');
@@ -68,11 +107,14 @@ export default defineConfig({
                   image: highResImg,
                   streamUrl: streamUrl,
                   has320: item['320kbps'] === 'true',
+                  source: 'saavn',
                 };
               }).filter((t: any) => Boolean(t.streamUrl));
 
+              const allResults = ytTrack ? [ytTrack, ...saavnResults] : saavnResults;
+
               res.setHeader('Content-Type', 'application/json');
-              res.end(JSON.stringify({ success: true, count: results.length, tracks: results }));
+              res.end(JSON.stringify({ success: true, count: allResults.length, tracks: allResults }));
             } catch (err: any) {
               res.statusCode = 500;
               res.setHeader('Content-Type', 'application/json');
@@ -104,6 +146,8 @@ export default defineConfig({
                   duration: parseInt(item.duration, 10) || 0,
                   image: highResImg,
                   streamUrl: streamUrl,
+                  has320: item['320kbps'] === 'true',
+                  source: 'saavn',
                 };
               }).filter((t: any) => Boolean(t.streamUrl));
 
@@ -113,6 +157,97 @@ export default defineConfig({
               res.statusCode = 500;
               res.setHeader('Content-Type', 'application/json');
               res.end(JSON.stringify({ error: err.message }));
+            }
+            return;
+          }
+
+          // YouTube Direct Link Endpoint
+          if (url.pathname === '/api/youtube') {
+            const rawUrl = url.searchParams.get('url') || url.searchParams.get('q');
+            if (!rawUrl) {
+              res.statusCode = 400;
+              res.setHeader('Content-Type', 'application/json');
+              res.end(JSON.stringify({ error: 'Missing YouTube URL or ID' }));
+              return;
+            }
+
+            const videoId = extractYouTubeId(rawUrl);
+            if (!videoId) {
+              res.statusCode = 400;
+              res.setHeader('Content-Type', 'application/json');
+              res.end(JSON.stringify({ error: 'Invalid YouTube link or video ID' }));
+              return;
+            }
+
+            try {
+              const oembedUrl = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`;
+              const oembedRes = await fetch(oembedUrl);
+              if (!oembedRes.ok) {
+                throw new Error('Video not found or embed is restricted by YouTube');
+              }
+              const oembed = await oembedRes.json();
+
+              const track = {
+                id: `yt-${videoId}`,
+                youtubeId: videoId,
+                source: 'youtube',
+                title: cleanHtml(oembed.title || 'YouTube Track'),
+                artist: cleanHtml(oembed.author_name || 'YouTube'),
+                album: 'YouTube',
+                duration: 0,
+                image: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+                streamUrl: `https://www.youtube.com/watch?v=${videoId}`,
+                has320: false,
+              };
+
+              res.setHeader('Content-Type', 'application/json');
+              res.end(JSON.stringify({ success: true, track }));
+            } catch (err: any) {
+              res.statusCode = 500;
+              res.setHeader('Content-Type', 'application/json');
+              res.end(JSON.stringify({ error: err.message }));
+            }
+            return;
+          }
+
+          // Recommendations / Autoplay Next Endpoint
+          if (url.pathname === '/api/recommendations') {
+            const artist = url.searchParams.get('artist') || '';
+            const title = url.searchParams.get('title') || '';
+            const currentId = url.searchParams.get('currentId') || '';
+
+            try {
+              // Search JioSaavn by artist or title
+              const query = artist ? artist.split(',')[0].trim() : title;
+              const saavnUrl = `https://www.jiosaavn.com/api.php?__call=search.getResults&_format=json&_marker=0&cc=in&n=20&p=1&q=${encodeURIComponent(query || 'Trending Hits')}`;
+              const saavnRes = await fetch(saavnUrl, {
+                headers: { 'User-Agent': 'Mozilla/5.0' },
+              });
+              const data = await saavnRes.json();
+              const results = (data.results || []).map((item: any) => {
+                const streamUrl = decryptMediaUrl(item.encrypted_media_url);
+                const rawImg = item.image || '';
+                const highResImg = rawImg.replace('150x150', '500x500').replace('50x50', '500x500');
+                return {
+                  id: item.id,
+                  title: cleanHtml(item.song),
+                  artist: cleanHtml(item.primary_artists || item.singers || 'Unknown Artist'),
+                  album: cleanHtml(item.album || ''),
+                  year: item.year || '',
+                  duration: parseInt(item.duration, 10) || 0,
+                  image: highResImg,
+                  streamUrl: streamUrl,
+                  has320: item['320kbps'] === 'true',
+                  source: 'saavn',
+                };
+              }).filter((t: any) => Boolean(t.streamUrl) && t.id !== currentId);
+
+              res.setHeader('Content-Type', 'application/json');
+              res.end(JSON.stringify({ success: true, count: results.length, tracks: results }));
+            } catch (err: any) {
+              res.statusCode = 500;
+              res.setHeader('Content-Type', 'application/json');
+              res.end(JSON.stringify({ error: err.message, tracks: [] }));
             }
             return;
           }

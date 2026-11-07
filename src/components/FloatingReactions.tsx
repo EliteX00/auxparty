@@ -16,10 +16,10 @@ export const FloatingReactions: React.FC = () => {
             left: `${r.x}%`,
           }}
         >
-          <span className="text-4xl drop-shadow-[0_4px_12px_rgba(0,0,0,0.8)] filter">
+          <span className="text-4xl select-none">
             {r.emoji}
           </span>
-          <span className="text-[10px] font-bold text-zinc-300 bg-black/60 px-1.5 py-0.5 rounded-full backdrop-blur-sm mt-1">
+          <span className="text-[10px] font-bold text-zinc-200 bg-zinc-950/80 border border-white/10 px-1.5 py-0.5 rounded-full shadow-md mt-1">
             {r.sender}
           </span>
         </div>

@@ -13,7 +13,9 @@ import {
   Share2,
   Play,
   Loader2,
+  Headphones,
 } from 'lucide-react';
+import { YoutubeIcon as Youtube } from '../components/YoutubeIcon';
 import { Track } from '../types';
 import { searchTracks, getTrendingTracks } from '../services/api';
 import { Navbar } from '../components/Navbar';
@@ -21,10 +23,12 @@ import { TrackCard } from '../components/TrackCard';
 import { TrackRow } from '../components/TrackRow';
 import { AudioPlayer } from '../components/AudioPlayer';
 import { SpotifyImportModal } from '../components/SpotifyImportModal';
+import { YouTubeModal } from '../components/YouTubeModal';
 import { RoomModal } from '../components/RoomModal';
 import { QueueDrawer } from '../components/QueueDrawer';
 import { FullscreenPlayer } from '../components/FullscreenPlayer';
 import { FloatingReactions } from '../components/FloatingReactions';
+import { AmbientBackground } from '../components/AmbientBackground';
 import { usePlayer } from '../context/PlayerContext';
 import { useRoom } from '../context/RoomContext';
 
@@ -43,6 +47,7 @@ export const HomePage: React.FC = () => {
 
   // Modals & Panels
   const [isSpotifyModalOpen, setIsSpotifyModalOpen] = useState(false);
+  const [isYouTubeModalOpen, setIsYouTubeModalOpen] = useState(false);
   const [isRoomModalOpen, setIsRoomModalOpen] = useState(false);
   const [isQueueOpen, setIsQueueOpen] = useState(false);
   const [isFullscreenOpen, setIsFullscreenOpen] = useState(false);
@@ -61,7 +66,7 @@ export const HomePage: React.FC = () => {
     loadTrending();
   }, []);
 
-  // Handle Search Input with Debounce
+  // Handle Search Input with Debounce (Automatically detects direct YouTube links!)
   useEffect(() => {
     if (!searchQuery.trim()) {
       setSearchResults([]);
@@ -116,13 +121,14 @@ export const HomePage: React.FC = () => {
   const displayedTracks = searchQuery.trim() ? searchResults : trendingTracks;
 
   return (
-    <div className="min-h-screen bg-[#09090b] text-zinc-100 flex flex-col pb-28 selection:bg-purple-600 selection:text-white">
-      {/* Top Navbar */}
+    <div className="min-h-screen text-zinc-100 flex flex-col pb-28 selection:bg-purple-600 selection:text-white relative">
+      {/* Top Glass Navbar */}
       <Navbar
         searchQuery={searchQuery}
         setSearchQuery={setSearchQuery}
         onSearchSubmit={handleSearchSubmit}
         openSpotifyModal={() => setIsSpotifyModalOpen(true)}
+        openYouTubeModal={() => setIsYouTubeModalOpen(true)}
         openRoomModal={() => setIsRoomModalOpen(true)}
         toggleQueue={() => setIsQueueOpen((prev) => !prev)}
         isQueueOpen={isQueueOpen}
@@ -130,34 +136,54 @@ export const HomePage: React.FC = () => {
 
       {/* Main Content Area */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 md:px-8 py-6 space-y-8">
-        {/* Hero Banner (Only when not actively searching) */}
+        {/* Hero Glass Banner (Only when not actively searching) */}
         {!searchQuery.trim() && (
-          <div className="relative overflow-hidden rounded-3xl bg-gradient-to-r from-purple-900/40 via-violet-950/40 to-zinc-900/60 border border-purple-500/20 p-6 md:p-10 shadow-2xl backdrop-blur-xl">
-            <div className="absolute -top-24 -right-24 w-96 h-96 bg-purple-600/20 rounded-full blur-3xl pointer-events-none"></div>
-            <div className="absolute -bottom-24 -left-24 w-80 h-80 bg-pink-600/15 rounded-full blur-3xl pointer-events-none"></div>
+          <div className="relative overflow-hidden rounded-3xl glass-panel p-6 sm:p-10 shadow-2xl border border-white/10">
+            {/* Native GPU radial glow blobs (Zero filter/blur overhead) */}
+            <div
+              className="absolute -top-24 -right-24 w-96 h-96 rounded-full pointer-events-none"
+              style={{ background: 'radial-gradient(circle, rgba(147, 51, 234, 0.25) 0%, transparent 70%)' }}
+            />
+            <div
+              className="absolute -bottom-24 -left-24 w-80 h-80 rounded-full pointer-events-none"
+              style={{ background: 'radial-gradient(circle, rgba(219, 39, 119, 0.2) 0%, transparent 70%)' }}
+            />
+            <div
+              className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-64 h-64 rounded-full pointer-events-none"
+              style={{ background: 'radial-gradient(circle, rgba(99, 102, 241, 0.15) 0%, transparent 70%)' }}
+            />
 
             <div className="relative z-10 max-w-2xl space-y-4">
-              <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-purple-500/10 border border-purple-500/30 text-purple-300 text-xs font-bold uppercase tracking-wider">
+              <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-white/5 border border-white/15 text-purple-300 text-xs font-bold uppercase tracking-wider">
                 <Radio className="w-3.5 h-3.5 text-purple-400 animate-pulse" />
-                Listen in Lockstep
+                Synchronized Lossless Listening
               </div>
 
               <h2 className="text-3xl sm:text-4xl md:text-5xl font-black tracking-tight text-white leading-tight">
-                Stream in <span className="bg-gradient-to-r from-purple-400 via-pink-400 to-indigo-400 bg-clip-text text-transparent">320kbps HIFI</span> with Friends.
+                Stream in <span className="bg-gradient-to-r from-purple-400 via-pink-400 to-indigo-300 bg-clip-text text-transparent">320kbps HIFI</span> & Direct YouTube.
               </h2>
 
               <p className="text-sm md:text-base text-zinc-300 font-medium leading-relaxed">
-                Zero subscriptions. No audio compression. Start a synced party room with your friends (e.g. <span className="font-mono text-purple-300 bg-purple-950/60 px-1.5 py-0.5 rounded border border-purple-500/30">/room/fg2f</span>) or import entire Spotify playlists with one click.
+                Zero subscriptions. No ads. Start a synced party room with friends, drop direct YouTube links, or import entire Spotify playlists with YouTube-style continuous autoplay.
               </p>
 
               <div className="pt-2 flex flex-wrap gap-3">
                 <button
                   onClick={() => setIsRoomModalOpen(true)}
-                  className="px-6 py-3 rounded-full bg-purple-600 hover:bg-purple-500 text-white font-bold text-sm shadow-xl shadow-purple-600/40 hover:scale-105 active:scale-95 transition-all flex items-center gap-2"
+                  className="px-6 py-3 rounded-full bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white font-bold text-sm shadow-xl shadow-purple-600/40 hover:scale-105 active:scale-95 transition-all flex items-center gap-2 border border-white/20"
                 >
                   <Radio className="w-4 h-4" />
-                  {roomState.connected ? `Go to Room #${roomState.roomCode}` : 'Create or Join Room'}
+                  {roomState.connected ? `Room #${roomState.roomCode}` : 'Create Party Room'}
                 </button>
+
+                <button
+                  onClick={() => setIsYouTubeModalOpen(true)}
+                  className="px-6 py-3 rounded-full bg-red-600/20 hover:bg-red-600/30 text-red-300 border border-red-500/40 font-bold text-sm hover:scale-105 active:scale-95 transition-all flex items-center gap-2 shadow-lg shadow-red-600/20"
+                >
+                  <Youtube className="w-4 h-4 text-red-400 fill-current" />
+                  Paste YouTube Link
+                </button>
+
                 <button
                   onClick={() => setIsSpotifyModalOpen(true)}
                   className="px-6 py-3 rounded-full bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40 font-bold text-sm hover:scale-105 active:scale-95 transition-all flex items-center gap-2"
@@ -177,10 +203,10 @@ export const HomePage: React.FC = () => {
               <button
                 key={g}
                 onClick={() => handleGenreClick(g)}
-                className={`px-4 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap transition-all ${
+                className={`px-4 py-1.5 rounded-full text-xs font-bold whitespace-nowrap transition-all ${
                   selectedGenre === g
-                    ? 'bg-purple-600 text-white shadow-md shadow-purple-600/30'
-                    : 'bg-zinc-900/80 hover:bg-zinc-800 text-zinc-400 hover:text-zinc-200 border border-zinc-800/80'
+                    ? 'bg-purple-600 text-white shadow-lg shadow-purple-600/40 border border-purple-400/40'
+                    : 'glass-button text-zinc-400 hover:text-white'
                 }`}
               >
                 {g}
@@ -188,19 +214,19 @@ export const HomePage: React.FC = () => {
             ))}
           </div>
 
-          <div className="hidden sm:flex items-center gap-1 bg-zinc-900/80 p-1 rounded-xl border border-zinc-800">
+          <div className="hidden sm:flex items-center gap-1 glass-panel p-1 rounded-2xl border border-white/10">
             <button
               onClick={() => setViewMode('grid')}
-              className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all ${
-                viewMode === 'grid' ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:text-white'
+              className={`px-3 py-1 rounded-xl text-xs font-bold transition-all ${
+                viewMode === 'grid' ? 'bg-white/15 text-white shadow-sm' : 'text-zinc-400 hover:text-white'
               }`}
             >
               Grid
             </button>
             <button
               onClick={() => setViewMode('list')}
-              className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all ${
-                viewMode === 'list' ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:text-white'
+              className={`px-3 py-1 rounded-xl text-xs font-bold transition-all ${
+                viewMode === 'list' ? 'bg-white/15 text-white shadow-sm' : 'text-zinc-400 hover:text-white'
               }`}
             >
               List
@@ -214,36 +240,36 @@ export const HomePage: React.FC = () => {
             {searchQuery.trim() ? (
               <>
                 <Search className="w-5 h-5 text-purple-400" />
-                <h3 className="text-xl font-bold text-white">
+                <h3 className="text-xl font-black text-white">
                   Results for "{searchQuery}"
                 </h3>
               </>
             ) : (
               <>
                 <Flame className="w-5 h-5 text-pink-500 animate-pulse" />
-                <h3 className="text-xl font-bold text-white">Trending Hits</h3>
+                <h3 className="text-xl font-black text-white">Trending Hits & Discovered Beats</h3>
               </>
             )}
             {isSearching && <Loader2 className="w-4 h-4 animate-spin text-purple-400 ml-2" />}
           </div>
 
-          <span className="text-xs text-zinc-500 font-medium">
-            {displayedTracks.length} studio-grade tracks
+          <span className="text-xs text-zinc-400 font-semibold">
+            {displayedTracks.length} high-fidelity tracks
           </span>
         </div>
 
         {/* Tracks Grid or List View */}
         {isSearching || (isLoadingTrending && displayedTracks.length === 0) ? (
-          <div className="py-20 flex flex-col items-center justify-center text-zinc-500 space-y-3">
-            <Loader2 className="w-8 h-8 animate-spin text-purple-500" />
-            <p className="text-xs">Fetching 320kbps streams...</p>
+          <div className="py-20 flex flex-col items-center justify-center text-zinc-400 space-y-3">
+            <Loader2 className="w-9 h-9 animate-spin text-purple-400" />
+            <p className="text-xs font-semibold">Fetching 320kbps streams & video links...</p>
           </div>
         ) : displayedTracks.length === 0 ? (
-          <div className="py-20 text-center text-zinc-500 space-y-2">
+          <div className="py-20 text-center text-zinc-500 space-y-3 glass-panel rounded-3xl p-8">
             <Music2 className="w-12 h-12 mx-auto opacity-30 text-purple-400" />
-            <p className="text-base font-semibold text-zinc-400">No tracks found</p>
-            <p className="text-xs text-zinc-600">
-              Try searching for an artist, song title, or album name.
+            <p className="text-base font-bold text-zinc-300">No tracks found</p>
+            <p className="text-xs text-zinc-500 max-w-sm mx-auto">
+              Try searching for an artist, song title, or paste any direct YouTube link!
             </p>
           </div>
         ) : viewMode === 'grid' ? (
@@ -253,7 +279,7 @@ export const HomePage: React.FC = () => {
             ))}
           </div>
         ) : (
-          <div className="bg-zinc-950/60 rounded-2xl border border-zinc-800/80 p-2 divide-y divide-zinc-900">
+          <div className="glass-panel rounded-3xl border border-white/10 p-3 divide-y divide-white/5">
             {displayedTracks.map((track, idx) => (
               <TrackRow key={track.id} track={track} index={idx} />
             ))}
@@ -261,7 +287,7 @@ export const HomePage: React.FC = () => {
         )}
       </main>
 
-      {/* Bottom Audio Player */}
+      {/* Bottom Audio Player with Glassmorphism and Autoplay */}
       <AudioPlayer
         toggleQueue={() => setIsQueueOpen((prev) => !prev)}
         isQueueOpen={isQueueOpen}
@@ -271,6 +297,12 @@ export const HomePage: React.FC = () => {
 
       {/* Slide-over Queue Drawer */}
       <QueueDrawer isOpen={isQueueOpen} onClose={() => setIsQueueOpen(false)} />
+
+      {/* Direct YouTube Modal */}
+      <YouTubeModal
+        isOpen={isYouTubeModalOpen}
+        onClose={() => setIsYouTubeModalOpen(false)}
+      />
 
       {/* Spotify Import Modal */}
       <SpotifyImportModal
@@ -286,9 +318,6 @@ export const HomePage: React.FC = () => {
         isOpen={isFullscreenOpen}
         onClose={() => setIsFullscreenOpen(false)}
       />
-
-      {/* Floating Reactions across screen */}
-      <FloatingReactions />
     </div>
   );
 };
