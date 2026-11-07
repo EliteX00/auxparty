@@ -11,6 +11,8 @@ export interface Track {
   addedBy?: string;
   votes?: number;
   votedBy?: string[];
+  source?: 'saavn' | 'youtube' | 'spotify';
+  youtubeId?: string;
 }
 
 export interface SpotifyTrack {
@@ -58,6 +60,7 @@ export interface RoomMessage {
   text: string;
   timestamp: number;
   isSystem?: boolean;
+  trackAttachment?: Track;
 }
 
 export interface FloatingReaction {

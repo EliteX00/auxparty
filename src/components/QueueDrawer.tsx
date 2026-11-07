@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
-import { X, Trash2, ListMusic, Music, History, Play } from 'lucide-react';
+import { X, Trash2, ListMusic, Music, History, Play, Sparkles } from 'lucide-react';
+import { YoutubeIcon as Youtube } from './YoutubeIcon';
 import { usePlayer } from '../context/PlayerContext';
 
 interface QueueDrawerProps {
@@ -8,34 +9,61 @@ interface QueueDrawerProps {
 }
 
 export const QueueDrawer: React.FC<QueueDrawerProps> = ({ isOpen, onClose }) => {
-  const { currentTrack, queue, history, removeFromQueue, clearQueue, playTrack } = usePlayer();
+  const {
+    currentTrack,
+    queue,
+    history,
+    isAutoplay,
+    autoplayTrack,
+    toggleAutoplay,
+    removeFromQueue,
+    clearQueue,
+    playTrack,
+  } = usePlayer();
   const [activeTab, setActiveTab] = useState<'queue' | 'history'>('queue');
 
   if (!isOpen) return null;
 
   return (
-    <aside className="fixed inset-y-0 right-0 z-50 w-full sm:w-96 bg-zinc-950/95 backdrop-blur-2xl border-l border-zinc-800 shadow-2xl flex flex-col animate-slide-left">
+    <aside className="fixed inset-y-0 right-0 z-50 w-full sm:w-96 glass-panel border-l border-white/10 shadow-2xl flex flex-col animate-slide-left">
       {/* Header */}
-      <div className="flex items-center justify-between p-5 border-b border-zinc-800/80">
+      <div className="flex items-center justify-between p-5 border-b border-white/10">
         <div className="flex items-center gap-2.5">
           <ListMusic className="w-5 h-5 text-purple-400" />
-          <h3 className="font-bold text-base text-zinc-100">Play Queue</h3>
+          <h3 className="font-extrabold text-base text-zinc-100">Play Queue</h3>
         </div>
-        <button
-          onClick={onClose}
-          className="p-1.5 rounded-full text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors"
-        >
-          <X className="w-5 h-5" />
-        </button>
+
+        <div className="flex items-center gap-2">
+          {/* Autoplay toggle switch */}
+          <button
+            onClick={toggleAutoplay}
+            className={`flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-bold border transition-all ${
+              isAutoplay
+                ? 'bg-red-500/20 text-red-300 border-red-500/40'
+                : 'glass-button text-zinc-400'
+            }`}
+            title={isAutoplay ? 'Autoplay ON' : 'Autoplay OFF'}
+          >
+            <div className={`w-1.5 h-1.5 rounded-full ${isAutoplay ? 'bg-red-400 animate-pulse' : 'bg-zinc-600'}`} />
+            <span>Autoplay</span>
+          </button>
+
+          <button
+            onClick={onClose}
+            className="p-1.5 rounded-full glass-button text-zinc-400 hover:text-white transition-colors"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
       </div>
 
       {/* Tabs */}
-      <div className="flex border-b border-zinc-800/80 px-4 pt-2">
+      <div className="flex border-b border-white/10 px-4 pt-2">
         <button
           onClick={() => setActiveTab('queue')}
-          className={`flex items-center gap-2 pb-2.5 px-3 text-xs font-semibold border-b-2 transition-all ${
+          className={`flex items-center gap-2 pb-2.5 px-3 text-xs font-bold border-b-2 transition-all ${
             activeTab === 'queue'
-              ? 'border-purple-500 text-purple-400'
+              ? 'border-purple-500 text-purple-300'
               : 'border-transparent text-zinc-400 hover:text-zinc-200'
           }`}
         >
@@ -44,9 +72,9 @@ export const QueueDrawer: React.FC<QueueDrawerProps> = ({ isOpen, onClose }) => 
         </button>
         <button
           onClick={() => setActiveTab('history')}
-          className={`flex items-center gap-2 pb-2.5 px-3 text-xs font-semibold border-b-2 transition-all ${
+          className={`flex items-center gap-2 pb-2.5 px-3 text-xs font-bold border-b-2 transition-all ${
             activeTab === 'history'
-              ? 'border-purple-500 text-purple-400'
+              ? 'border-purple-500 text-purple-300'
               : 'border-transparent text-zinc-400 hover:text-zinc-200'
           }`}
         >
@@ -59,17 +87,20 @@ export const QueueDrawer: React.FC<QueueDrawerProps> = ({ isOpen, onClose }) => 
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
         {/* Now Playing Banner */}
         {currentTrack && (
-          <div className="p-3 rounded-2xl bg-purple-950/20 border border-purple-500/30 flex items-center gap-3">
+          <div className="p-3.5 rounded-2xl glass-card border-purple-500/30 flex items-center gap-3 shadow-lg shadow-purple-950/20">
             <img
               src={currentTrack.image}
               alt={currentTrack.title}
-              className="w-11 h-11 rounded-lg object-cover shadow"
+              className="w-12 h-12 rounded-xl object-cover shadow border border-white/10"
             />
             <div className="min-w-0 flex-1">
-              <span className="text-[10px] font-bold uppercase tracking-wider text-purple-400 block">
+              <span className="text-[10px] font-black uppercase tracking-wider text-purple-300 flex items-center gap-1.5">
                 Now Playing
+                {currentTrack.source === 'youtube' && (
+                  <Youtube className="w-3 h-3 text-red-500 fill-current inline" />
+                )}
               </span>
-              <p className="text-sm font-semibold text-zinc-100 truncate">
+              <p className="text-sm font-bold text-zinc-100 truncate">
                 {currentTrack.title}
               </p>
               <p className="text-xs text-zinc-400 truncate">{currentTrack.artist}</p>
@@ -84,7 +115,7 @@ export const QueueDrawer: React.FC<QueueDrawerProps> = ({ isOpen, onClose }) => 
 
         {activeTab === 'queue' ? (
           <div>
-            <div className="flex items-center justify-between text-xs text-zinc-400 mb-2">
+            <div className="flex items-center justify-between text-xs text-zinc-400 mb-2 font-medium">
               <span>Next In Line</span>
               {queue.length > 0 && (
                 <button
@@ -98,28 +129,63 @@ export const QueueDrawer: React.FC<QueueDrawerProps> = ({ isOpen, onClose }) => 
             </div>
 
             {queue.length === 0 ? (
-              <div className="py-12 text-center text-zinc-500 text-xs">
-                <Music className="w-8 h-8 mx-auto mb-2 opacity-30" />
-                <p>Your queue is empty.</p>
-                <p className="text-[11px] text-zinc-600 mt-1">
-                  Add tracks from search or import a Spotify playlist!
-                </p>
+              <div className="space-y-4 py-4">
+                {/* YouTube Autoplay Up Next Card */}
+                {isAutoplay && autoplayTrack ? (
+                  <div className="p-3.5 rounded-2xl glass-card border border-red-500/20 bg-red-950/10 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[10px] uppercase font-black tracking-wider text-red-300 flex items-center gap-1">
+                        <Sparkles className="w-3 h-3 text-red-400" />
+                        Autoplay Next (YouTube Mode)
+                      </span>
+                      <span className="text-[10px] font-bold text-zinc-500 font-mono">Auto</span>
+                    </div>
+
+                    <div
+                      onClick={() => playTrack(autoplayTrack, [])}
+                      className="flex items-center gap-3 cursor-pointer group"
+                    >
+                      <img
+                        src={autoplayTrack.image}
+                        alt={autoplayTrack.title}
+                        className="w-11 h-11 rounded-xl object-cover border border-white/10 group-hover:scale-105 transition-all"
+                      />
+                      <div className="min-w-0 flex-1">
+                        <p className="font-bold text-xs text-zinc-200 truncate group-hover:text-red-300">
+                          {autoplayTrack.title}
+                        </p>
+                        <p className="text-[11px] text-zinc-400 truncate">{autoplayTrack.artist}</p>
+                      </div>
+                      <button className="p-2 rounded-xl glass-button text-red-400 hover:text-white group-hover:scale-110 transition-all">
+                        <Play className="w-3.5 h-3.5 fill-current" />
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="py-12 text-center text-zinc-500 text-xs">
+                    <Music className="w-8 h-8 mx-auto mb-2 opacity-30" />
+                    <p>Your queue is empty.</p>
+                    <p className="text-[11px] text-zinc-600 mt-1">
+                      Search above, paste a YouTube link, or import Spotify!
+                    </p>
+                  </div>
+                )}
               </div>
             ) : (
               <div className="space-y-1.5">
                 {queue.map((track, idx) => (
                   <div
                     key={`${track.id}-${idx}`}
-                    className="group flex items-center justify-between p-2 rounded-xl hover:bg-zinc-900 border border-transparent hover:border-zinc-800 transition-all text-xs"
+                    className="group flex items-center justify-between p-2 rounded-xl glass-card border-transparent hover:border-white/10 transition-all text-xs"
                   >
                     <div
                       className="flex items-center gap-2.5 truncate cursor-pointer flex-1"
                       onClick={() => playTrack(track, queue.filter((_, i) => i !== idx))}
                     >
                       <span className="text-zinc-500 w-4 text-center font-mono">{idx + 1}</span>
-                      <img src={track.image} alt={track.title} className="w-8 h-8 rounded object-cover" />
+                      <img src={track.image} alt={track.title} className="w-8 h-8 rounded-lg object-cover" />
                       <div className="truncate">
-                        <p className="font-semibold text-zinc-200 truncate group-hover:text-purple-400">
+                        <p className="font-semibold text-zinc-200 truncate group-hover:text-purple-300">
                           {track.title}
                         </p>
                         <p className="text-[11px] text-zinc-500 truncate">{track.artist}</p>
@@ -138,7 +204,7 @@ export const QueueDrawer: React.FC<QueueDrawerProps> = ({ isOpen, onClose }) => 
           </div>
         ) : (
           <div>
-            <div className="text-xs text-zinc-400 mb-2">Played History</div>
+            <div className="text-xs text-zinc-400 mb-2 font-medium">Played History</div>
             {history.length === 0 ? (
               <div className="py-12 text-center text-zinc-500 text-xs">
                 <History className="w-8 h-8 mx-auto mb-2 opacity-30" />
@@ -150,12 +216,12 @@ export const QueueDrawer: React.FC<QueueDrawerProps> = ({ isOpen, onClose }) => 
                   <div
                     key={`${track.id}-hist-${idx}`}
                     onClick={() => playTrack(track)}
-                    className="group flex items-center justify-between p-2 rounded-xl hover:bg-zinc-900 border border-transparent hover:border-zinc-800 transition-all text-xs cursor-pointer"
+                    className="group flex items-center justify-between p-2 rounded-xl glass-card border-transparent hover:border-white/10 transition-all text-xs cursor-pointer"
                   >
                     <div className="flex items-center gap-2.5 truncate flex-1">
-                      <img src={track.image} alt={track.title} className="w-8 h-8 rounded object-cover" />
+                      <img src={track.image} alt={track.title} className="w-8 h-8 rounded-lg object-cover" />
                       <div className="truncate">
-                        <p className="font-semibold text-zinc-200 truncate group-hover:text-purple-400">
+                        <p className="font-semibold text-zinc-200 truncate group-hover:text-purple-300">
                           {track.title}
                         </p>
                         <p className="text-[11px] text-zinc-500 truncate">{track.artist}</p>
